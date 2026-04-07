@@ -83,20 +83,29 @@ SESSION_TIMEOUT_MINUTES = 30
 
 # One threading lock guards all writes so concurrent Streamlit sessions
 # never corrupt the database.  SQLite WAL mode allows concurrent reads.
+# A second lock ensures the connection is only initialised once.
 _db_write_lock = threading.Lock()
+_db_init_lock = threading.Lock()
+_db_conn: sqlite3.Connection | None = None
 
 
-@st.cache_resource
 def _get_conn() -> sqlite3.Connection:
     """
-    Open (and initialise) the SQLite database.  Called once per Streamlit
-    worker process; the connection is shared across all sessions/threads.
+    Return the shared SQLite connection, creating and initialising it on the
+    first call.  Plain module-level singleton — no Streamlit cache machinery
+    required, so it works reliably across all Domino/Streamlit configurations.
     """
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(
+    global _db_conn
+    if _db_conn is not None:
+        return _db_conn
+    with _db_init_lock:
+        if _db_conn is not None:   # another thread may have set it while we waited
+            return _db_conn
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
             id            TEXT PRIMARY KEY,
@@ -159,9 +168,10 @@ def _get_conn() -> sqlite3.Connection:
             updated_by    TEXT
         );
         """
-    )
-    conn.commit()
-    return conn
+        )
+        conn.commit()
+        _db_conn = conn
+    return _db_conn
 
 
 def _db_write(sql: str, params: tuple = ()) -> None:
