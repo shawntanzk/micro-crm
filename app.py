@@ -1,16 +1,17 @@
 """
 Research Partnership CRM
 A lightweight CRM for tracking research partnership leads.
-Multi-user, admin-controlled, file-backed.
+Multi-user, admin-controlled, SQLite-backed.
 """
 
 import streamlit as st
 import json
 import os
+import sqlite3
+import threading
 import uuid
 from datetime import datetime
 import pandas as pd
-from filelock import FileLock
 import bcrypt
 import plotly.express as px
 
@@ -26,13 +27,15 @@ st.set_page_config(
 # ─── Data Directory ───────────────────────────────────────────────────────────
 
 # On Domino, point DATA_DIR at your persisted dataset mount, e.g.:
-#   DATA_DIR = "/domino/datasets/local/crm_data"
+#   CRM_DATA_DIR = "/domino/datasets/local/crm_data"
 # For local development the sibling `data/` folder is used.
 DATA_DIR = os.environ.get(
     "CRM_DATA_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
 )
 os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.path.join(DATA_DIR, "crm.db")
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -76,39 +79,138 @@ STAGE_COLORS = {
 
 SESSION_TIMEOUT_MINUTES = 30
 
-# ─── Low-Level File Helpers ───────────────────────────────────────────────────
+# ─── Database Helpers ─────────────────────────────────────────────────────────
+
+# One threading lock guards all writes so concurrent Streamlit sessions
+# never corrupt the database.  SQLite WAL mode allows concurrent reads.
+_db_write_lock = threading.Lock()
 
 
-def _path(filename: str) -> str:
-    return os.path.join(DATA_DIR, filename)
+@st.cache_resource
+def _get_conn() -> sqlite3.Connection:
+    """
+    Open (and initialise) the SQLite database.  Called once per Streamlit
+    worker process; the connection is shared across all sessions/threads.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id            TEXT PRIMARY KEY,
+            username      TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role          TEXT NOT NULL DEFAULT 'viewer',
+            is_active     INTEGER NOT NULL DEFAULT 1,
+            created_at    TEXT,
+            created_by    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS contacts (
+            id                TEXT PRIMARY KEY,
+            name              TEXT NOT NULL,
+            institution       TEXT,
+            role              TEXT,
+            email             TEXT,
+            phone             TEXT,
+            country           TEXT,
+            website           TEXT,
+            partnership_stage TEXT,
+            notes             TEXT,
+            tags              TEXT DEFAULT '[]',
+            last_contacted    TEXT,
+            created_at        TEXT,
+            created_by        TEXT,
+            updated_at        TEXT,
+            updated_by        TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS meetings (
+            id              TEXT PRIMARY KEY,
+            contact_ids     TEXT DEFAULT '[]',
+            contact_display TEXT,
+            date            TEXT,
+            meeting_type    TEXT,
+            summary         TEXT,
+            attendees       TEXT DEFAULT '[]',
+            notes           TEXT,
+            action_items    TEXT,
+            created_at      TEXT,
+            created_by      TEXT,
+            updated_at      TEXT,
+            updated_by      TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS datasets (
+            id            TEXT PRIMARY KEY,
+            contact_id    TEXT,
+            name          TEXT NOT NULL,
+            format        TEXT,
+            status        TEXT,
+            acquired_date TEXT,
+            size          TEXT,
+            description   TEXT,
+            notes         TEXT,
+            created_at    TEXT,
+            created_by    TEXT,
+            updated_at    TEXT,
+            updated_by    TEXT
+        );
+        """
+    )
+    conn.commit()
+    return conn
 
 
-def _load(filename: str) -> list:
-    """Read JSON; return [] on missing/corrupt file."""
-    p = _path(filename)
-    if not os.path.exists(p):
-        return []
-    with open(p, "r") as fh:
+def _db_write(sql: str, params: tuple = ()) -> None:
+    """Execute a single write statement inside the global write lock."""
+    with _db_write_lock:
+        conn = _get_conn()
+        conn.execute(sql, params)
+        conn.commit()
+
+
+def _db_query(sql: str, params: tuple = ()) -> list:
+    """Run a SELECT and return a list of plain dicts."""
+    conn = _get_conn()
+    cur = conn.execute(sql, params)
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _db_query_one(sql: str, params: tuple = ()) -> dict | None:
+    """Run a SELECT and return a single plain dict, or None."""
+    conn = _get_conn()
+    cur = conn.execute(sql, params)
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+# ── Row parsers: deserialise JSON-stored fields ───────────────────────────────
+
+def _parse_user(row: dict) -> dict:
+    row["is_active"] = bool(row.get("is_active", 1))
+    return row
+
+
+def _parse_contact(row: dict) -> dict:
+    raw = row.get("tags")
+    try:
+        row["tags"] = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        row["tags"] = []
+    return row
+
+
+def _parse_meeting(row: dict) -> dict:
+    for field in ("contact_ids", "attendees"):
+        raw = row.get(field)
         try:
-            return json.load(fh)
-        except (json.JSONDecodeError, ValueError):
-            return []
-
-
-def _atomic_update(filename: str, fn):
-    """
-    Hold a file lock, read current data, apply fn(data) -> new_data, write back.
-    Returns the new data list.  Safe for concurrent Streamlit sessions.
-    """
-    lock = FileLock(_path(filename) + ".lock", timeout=15)
-    with lock:
-        data = _load(filename)
-        result = fn(data)
-        if result is None:
-            result = data
-        with open(_path(filename), "w") as fh:
-            json.dump(result, fh, indent=2, default=str)
-        return result
+            row[field] = json.loads(raw) if raw else []
+        except (ValueError, TypeError):
+            row[field] = []
+    return row
 
 
 def check_session_timeout():
@@ -129,14 +231,16 @@ def check_session_timeout():
 
 
 def get_users() -> list:
-    return _load("users.json")
+    rows = _db_query("SELECT * FROM users ORDER BY created_at")
+    return [_parse_user(r) for r in rows]
 
 
 def find_user(username: str) -> dict | None:
-    for u in get_users():
-        if u["username"].lower() == username.strip().lower():
-            return u
-    return None
+    row = _db_query_one(
+        "SELECT * FROM users WHERE lower(username) = ?",
+        (username.strip().lower(),),
+    )
+    return _parse_user(row) if row else None
 
 
 def authenticate(username: str, password: str) -> dict | None:
@@ -204,99 +308,116 @@ ROLE_DESCRIPTIONS = {
 
 
 def create_user(username: str, password: str, role: str, created_by: str) -> dict:
-    new_user = {
-        "id": str(uuid.uuid4()),
-        "username": username,
-        "password_hash": hash_password(password),
-        "role": role,
-        "is_active": True,
-        "created_at": datetime.now().isoformat(),
-        "created_by": created_by,
-    }
-
-    def _add(data):
-        data.append(new_user)
-        return data
-
-    _atomic_update("users.json", _add)
-    return new_user
+    uid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    _db_write(
+        """
+        INSERT INTO users (id, username, password_hash, role, is_active, created_at, created_by)
+        VALUES (?, ?, ?, ?, 1, ?, ?)
+        """,
+        (uid, username, hash_password(password), role, now, created_by),
+    )
+    return find_user(username)
 
 
 def update_user_field(uid: str, field: str, value) -> None:
-    def _upd(data):
-        for u in data:
-            if u["id"] == uid:
-                u[field] = value
-        return data
-
-    _atomic_update("users.json", _upd)
+    _ALLOWED = {"role", "is_active"}
+    if field not in _ALLOWED:
+        raise ValueError(f"Field '{field}' cannot be updated via update_user_field")
+    _db_write(f"UPDATE users SET {field} = ? WHERE id = ?", (value, uid))
 
 
 def reset_user_password(uid: str, new_password: str) -> None:
-    def _upd(data):
-        for u in data:
-            if u["id"] == uid:
-                u["password_hash"] = hash_password(new_password)
-        return data
-
-    _atomic_update("users.json", _upd)
+    _db_write(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (hash_password(new_password), uid),
+    )
 
 
 # ─── CRUD: Contacts ───────────────────────────────────────────────────────────
 
+_CONTACT_COLUMNS = frozenset(
+    {
+        "name", "institution", "role", "email", "phone", "country",
+        "website", "partnership_stage", "notes", "tags", "last_contacted",
+    }
+)
+
 
 def get_contacts() -> list:
-    return _load("contacts.json")
+    rows = _db_query("SELECT * FROM contacts ORDER BY name")
+    return [_parse_contact(r) for r in rows]
 
 
 def get_contact(cid: str) -> dict | None:
-    for c in get_contacts():
-        if c["id"] == cid:
-            return c
-    return None
+    row = _db_query_one("SELECT * FROM contacts WHERE id = ?", (cid,))
+    return _parse_contact(row) if row else None
 
 
 def create_contact(fields: dict, username: str) -> dict:
     now = datetime.now().isoformat()
-    record = {
-        "id": str(uuid.uuid4()),
-        "created_at": now,
-        "created_by": username,
-        "updated_at": now,
-        "updated_by": username,
-        "last_contacted": None,
-        **fields,
-    }
-
-    def _add(data):
-        data.append(record)
-        return data
-
-    _atomic_update("contacts.json", _add)
-    return record
+    cid = str(uuid.uuid4())
+    _db_write(
+        """
+        INSERT INTO contacts
+            (id, name, institution, role, email, phone, country, website,
+             partnership_stage, notes, tags, last_contacted,
+             created_at, created_by, updated_at, updated_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            cid,
+            fields.get("name", ""),
+            fields.get("institution", ""),
+            fields.get("role", ""),
+            fields.get("email", ""),
+            fields.get("phone", ""),
+            fields.get("country", ""),
+            fields.get("website", ""),
+            fields.get("partnership_stage", ""),
+            fields.get("notes", ""),
+            json.dumps(fields.get("tags", [])),
+            fields.get("last_contacted"),
+            now, username, now, username,
+        ),
+    )
+    return get_contact(cid)
 
 
 def update_contact(cid: str, fields: dict, username: str) -> None:
-    def _upd(data):
-        for c in data:
-            if c["id"] == cid:
-                c.update(fields)
-                c["updated_at"] = datetime.now().isoformat()
-                c["updated_by"] = username
-        return data
-
-    _atomic_update("contacts.json", _upd)
+    now = datetime.now().isoformat()
+    safe = {}
+    for k, v in fields.items():
+        if k in _CONTACT_COLUMNS:
+            safe[k] = json.dumps(v) if k == "tags" else v
+    if not safe:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in safe)
+    params = tuple(safe.values()) + (now, username, cid)
+    _db_write(
+        f"UPDATE contacts SET {set_clause}, updated_at = ?, updated_by = ? WHERE id = ?",
+        params,
+    )
 
 
 def delete_contact(cid: str) -> None:
-    _atomic_update("contacts.json", lambda d: [c for c in d if c["id"] != cid])
+    _db_write("DELETE FROM contacts WHERE id = ?", (cid,))
 
 
 # ─── CRUD: Meetings ───────────────────────────────────────────────────────────
 
+_MEETING_COLUMNS = frozenset(
+    {
+        "contact_ids", "contact_display", "date", "meeting_type",
+        "summary", "attendees", "notes", "action_items",
+    }
+)
+_MEETING_JSON_FIELDS = frozenset({"contact_ids", "attendees"})
+
 
 def get_meetings() -> list:
-    return _load("meetings.json")
+    rows = _db_query("SELECT * FROM meetings ORDER BY date DESC")
+    return [_parse_meeting(r) for r in rows]
 
 
 def _meeting_contact_ids(meeting: dict) -> list:
@@ -324,18 +445,30 @@ def _recalculate_last_contacted(cid: str, username: str) -> None:
 
 
 def create_meeting(fields: dict, username: str) -> dict:
-    record = {
-        "id": str(uuid.uuid4()),
-        "created_at": datetime.now().isoformat(),
-        "created_by": username,
-        **fields,
-    }
-
-    def _add(data):
-        data.append(record)
-        return data
-
-    _atomic_update("meetings.json", _add)
+    mid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    _db_write(
+        """
+        INSERT INTO meetings
+            (id, contact_ids, contact_display, date, meeting_type,
+             summary, attendees, notes, action_items, created_at, created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            mid,
+            json.dumps(fields.get("contact_ids", [])),
+            fields.get("contact_display", ""),
+            fields.get("date", ""),
+            fields.get("meeting_type", ""),
+            fields.get("summary", ""),
+            json.dumps(fields.get("attendees", [])),
+            fields.get("notes", ""),
+            fields.get("action_items", ""),
+            now, username,
+        ),
+    )
+    record = _db_query_one("SELECT * FROM meetings WHERE id = ?", (mid,))
+    record = _parse_meeting(record)
     for cid in _meeting_contact_ids(record):
         _recalculate_last_contacted(cid, username)
     return record
@@ -377,73 +510,93 @@ def meeting_all_attendees(meeting: dict, contact_map: dict) -> list[str]:
 
 
 def update_meeting(mid: str, fields: dict, username: str) -> None:
-    def _upd(data):
-        for m in data:
-            if m["id"] == mid:
-                m.update(fields)
-                m["updated_at"] = datetime.now().isoformat()
-                m["updated_by"] = username
-        return data
-
-    _atomic_update("meetings.json", _upd)
-    meeting = next((m for m in get_meetings() if m["id"] == mid), None)
+    now = datetime.now().isoformat()
+    safe = {}
+    for k, v in fields.items():
+        if k in _MEETING_COLUMNS:
+            safe[k] = json.dumps(v) if k in _MEETING_JSON_FIELDS else v
+    if not safe:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in safe)
+    params = tuple(safe.values()) + (now, username, mid)
+    _db_write(
+        f"UPDATE meetings SET {set_clause}, updated_at = ?, updated_by = ? WHERE id = ?",
+        params,
+    )
+    meeting = _db_query_one("SELECT * FROM meetings WHERE id = ?", (mid,))
     if meeting:
+        meeting = _parse_meeting(meeting)
         for cid in _meeting_contact_ids(meeting):
             _recalculate_last_contacted(cid, username)
 
 
 def delete_meeting(mid: str, username: str = "system") -> None:
-    meeting = next((m for m in get_meetings() if m["id"] == mid), None)
-    linked_cids = _meeting_contact_ids(meeting) if meeting else []
-    _atomic_update("meetings.json", lambda d: [m for m in d if m["id"] != mid])
+    meeting = _db_query_one("SELECT * FROM meetings WHERE id = ?", (mid,))
+    linked_cids = _meeting_contact_ids(_parse_meeting(meeting)) if meeting else []
+    _db_write("DELETE FROM meetings WHERE id = ?", (mid,))
     for cid in linked_cids:
         _recalculate_last_contacted(cid, username)
 
 
 # ─── CRUD: Datasets ───────────────────────────────────────────────────────────
 
+_DATASET_COLUMNS = frozenset(
+    {
+        "contact_id", "name", "format", "status",
+        "acquired_date", "size", "description", "notes",
+    }
+)
+
 
 def get_datasets() -> list:
-    return _load("datasets.json")
+    return _db_query("SELECT * FROM datasets ORDER BY acquired_date DESC")
 
 
 def get_datasets_for_contact(cid: str) -> list:
-    return [d for d in get_datasets() if d["contact_id"] == cid]
+    return _db_query("SELECT * FROM datasets WHERE contact_id = ?", (cid,))
 
 
 def create_dataset(fields: dict, username: str) -> dict:
     now = datetime.now().isoformat()
-    record = {
-        "id": str(uuid.uuid4()),
-        "created_at": now,
-        "created_by": username,
-        "updated_at": now,
-        "updated_by": username,
-        **fields,
-    }
-
-    def _add(data):
-        data.append(record)
-        return data
-
-    _atomic_update("datasets.json", _add)
-    return record
+    did = str(uuid.uuid4())
+    _db_write(
+        """
+        INSERT INTO datasets
+            (id, contact_id, name, format, status, acquired_date, size,
+             description, notes, created_at, created_by, updated_at, updated_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            did,
+            fields.get("contact_id", ""),
+            fields.get("name", ""),
+            fields.get("format", ""),
+            fields.get("status", ""),
+            fields.get("acquired_date", ""),
+            fields.get("size", ""),
+            fields.get("description", ""),
+            fields.get("notes", ""),
+            now, username, now, username,
+        ),
+    )
+    return _db_query_one("SELECT * FROM datasets WHERE id = ?", (did,))
 
 
 def update_dataset(did: str, fields: dict, username: str) -> None:
-    def _upd(data):
-        for d in data:
-            if d["id"] == did:
-                d.update(fields)
-                d["updated_at"] = datetime.now().isoformat()
-                d["updated_by"] = username
-        return data
-
-    _atomic_update("datasets.json", _upd)
+    now = datetime.now().isoformat()
+    safe = {k: v for k, v in fields.items() if k in _DATASET_COLUMNS}
+    if not safe:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in safe)
+    params = tuple(safe.values()) + (now, username, did)
+    _db_write(
+        f"UPDATE datasets SET {set_clause}, updated_at = ?, updated_by = ? WHERE id = ?",
+        params,
+    )
 
 
 def delete_dataset(did: str) -> None:
-    _atomic_update("datasets.json", lambda d: [x for x in d if x["id"] != did])
+    _db_write("DELETE FROM datasets WHERE id = ?", (did,))
 
 
 # ─── UI: Login / First-Run Setup ──────────────────────────────────────────────
@@ -1184,7 +1337,6 @@ def page_meetings():
 
             st.divider()
             st.subheader("Full Meeting Notes")
-            _OTHER = "— Other (not in system) —"
             for m in filtered:
                 label = (
                     f"📅 {m.get('date')}  ·  {meeting_contact_label(m, contact_map)}"

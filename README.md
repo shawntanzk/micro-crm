@@ -18,7 +18,7 @@ A lightweight, multi-user CRM built with Streamlit for tracking research partner
 | **Self-service password change** | Any user can change their own password from the sidebar. Requires the current password to confirm |
 | **Activity log** | Full audit trail of every create/update action and who performed it, visible to admins |
 | **CSV export** | Export contacts, meetings, datasets, or the activity log to CSV from within the app |
-| **Concurrent access** | File-level locking (`filelock`) prevents data corruption when multiple users write simultaneously |
+| **Concurrent access** | SQLite WAL mode + a threading lock prevent data corruption when multiple users write simultaneously |
 
 ---
 
@@ -30,14 +30,19 @@ micro-crm/
 ├── app.sh              # Domino App launcher script
 ├── requirements.txt    # Python dependencies
 ├── README.md           # This file
-└── data/               # Auto-created at runtime — all JSON data lives here
-    ├── users.json
-    ├── contacts.json
-    ├── meetings.json
-    └── datasets.json
+└── data/               # Auto-created at runtime — SQLite database lives here
+    └── crm.db          # Single-file database (users, contacts, meetings, datasets)
 ```
 
-> **Important:** The `data/` directory must be on **persisted storage** in Domino (see Step 4 below), otherwise data is lost when the workspace or app restarts.
+> **Important:** The `data/` directory (and therefore `crm.db`) must be on **persisted storage** in Domino (see Step 4 below), otherwise data is lost when the workspace or app restarts.
+
+---
+
+## Backend: SQLite
+
+All data is stored in a single SQLite file (`crm.db`) inside `CRM_DATA_DIR`. SQLite is embedded directly in the Python process — no separate database server is required. This makes it ideal for Domino: just point `CRM_DATA_DIR` at a persisted dataset mount and the database file travels with it.
+
+Concurrent writes from multiple Streamlit sessions are serialised by a threading lock; reads are unrestricted thanks to SQLite's WAL (Write-Ahead Logging) mode.
 
 ---
 
@@ -47,7 +52,7 @@ micro-crm/
 
 1. In the Domino UI, go to your project and click **Data** in the left sidebar.
 2. Click **Create Dataset** and name it `crm_data`.
-3. Note the mount path shown — it will be something like `/domino/datasets/local/crm_data`. This is where the JSON files will be stored across restarts.
+3. Note the mount path shown — it will be something like `/domino/datasets/local/crm_data`. The `crm.db` file will be stored here.
 
 ### Step 2 — Set the data directory environment variable
 
@@ -55,7 +60,7 @@ micro-crm/
 2. Add a new variable:
    - **Name:** `CRM_DATA_DIR`
    - **Value:** `/domino/datasets/local/crm_data`
-3. Save. This tells the app where to store its data files.
+3. Save. This tells the app where to create and read `crm.db`.
 
 > If you skip this step, the app falls back to a local `data/` folder inside the workspace, which **will not persist** between restarts.
 
@@ -84,7 +89,7 @@ Alternatively, bake the dependencies into your Domino **Environment** (Docker im
 1. Go to **Environments** in the Domino sidebar.
 2. Edit or create an environment and add the following to the Dockerfile instructions:
    ```
-   RUN pip install streamlit>=1.35.0 pandas>=2.0.0 plotly>=5.18.0 bcrypt>=4.1.0 filelock>=3.13.0
+   RUN pip install streamlit>=1.35.0 pandas>=2.0.0 plotly>=5.18.0 bcrypt>=4.1.0
    ```
 3. Build the environment and select it for your project.
 
@@ -162,7 +167,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app opens at `http://localhost:8501`. Data is stored in the `data/` folder next to `app.py`.
+The app opens at `http://localhost:8501`. The database (`crm.db`) is created automatically in the `data/` folder next to `app.py`.
 
 ---
 
@@ -185,16 +190,19 @@ This is useful if you want to point multiple Domino workspaces or app instances 
 
 ## Backing up your data
 
-All data is stored as plain JSON files in `CRM_DATA_DIR`:
+All data lives in a single file:
 
 | File | Contents |
 |---|---|
-| `users.json` | User accounts and hashed passwords |
-| `contacts.json` | All contact records |
-| `meetings.json` | All meeting notes |
-| `datasets.json` | All dataset records |
+| `crm.db` | Everything — users, contacts, meetings, datasets |
 
-To back up, copy these four files. To restore, replace them. The `.lock` files (e.g. `contacts.json.lock`) are transient and can be deleted safely if the app is not running.
+To back up, copy `crm.db`. To restore, stop the app and replace `crm.db` with your backup copy.
+
+You can also take a safe online backup using SQLite's built-in tool:
+
+```bash
+sqlite3 /path/to/crm_data/crm.db ".backup /path/to/backup/crm_backup.db"
+```
 
 ---
 
@@ -206,11 +214,17 @@ To back up, copy these four files. To restore, replace them. The `.lock` files (
 **"Permission denied writing to data directory"**
 → The Domino Dataset may have been mounted read-only. Check your dataset permissions in Domino's Data settings.
 
-**"filelock.Timeout" error**
-→ A previous app instance may have crashed and left a stale `.lock` file. Delete any `*.lock` files inside `CRM_DATA_DIR` and restart the app.
+**"database is locked" error**
+→ Rare with WAL mode. If it persists, it usually means a previous process crashed mid-write. Stop the app, then run `sqlite3 crm.db "PRAGMA integrity_check;"` to verify the database is healthy before restarting.
 
 **"bcrypt not found" / import errors**
 → Run `pip install -r requirements.txt` in your workspace, or bake the dependencies into your Domino Environment image.
 
 **App is slow to load**
-→ The app loads all JSON files on each page render. For very large datasets (thousands of contacts/meetings), consider migrating the backend to SQLite using the same file-based approach with the `sqlite3` standard library.
+→ The app queries SQLite on each page render. For very large datasets (tens of thousands of rows) you can add indexes:
+```sql
+CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name);
+CREATE INDEX IF NOT EXISTS idx_meetings_date ON meetings(date);
+CREATE INDEX IF NOT EXISTS idx_datasets_contact ON datasets(contact_id);
+```
+Run these once via `sqlite3 crm.db` in a workspace terminal.
