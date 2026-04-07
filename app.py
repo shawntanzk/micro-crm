@@ -74,6 +74,8 @@ STAGE_COLORS = {
     "Inactive": "#f87171",
 }
 
+SESSION_TIMEOUT_MINUTES = 30
+
 # ─── Low-Level File Helpers ───────────────────────────────────────────────────
 
 
@@ -107,6 +109,20 @@ def _atomic_update(filename: str, fn):
         with open(_path(filename), "w") as fh:
             json.dump(result, fh, indent=2, default=str)
         return result
+
+
+def check_session_timeout():
+    """Log out the user after SESSION_TIMEOUT_MINUTES of inactivity."""
+    if "user" not in st.session_state:
+        return
+    last = st.session_state.get("last_activity")
+    if last:
+        elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds() / 60
+        if elapsed > SESSION_TIMEOUT_MINUTES:
+            st.session_state.clear()
+            st.warning(f"You were logged out after {SESSION_TIMEOUT_MINUTES} minutes of inactivity.")
+            st.stop()
+    st.session_state["last_activity"] = datetime.now().isoformat()
 
 
 # ─── Auth Helpers ─────────────────────────────────────────────────────────────
@@ -299,6 +315,14 @@ def get_meetings_for_contact(cid: str) -> list:
     return [m for m in get_meetings() if cid in _meeting_contact_ids(m)]
 
 
+def _recalculate_last_contacted(cid: str, username: str) -> None:
+    """Set last_contacted to the most recent meeting date across all meetings for this contact."""
+    all_meetings = get_meetings_for_contact(cid)
+    dates = [m.get("date", "") for m in all_meetings if m.get("date")]
+    latest = max(dates) if dates else None
+    update_contact(cid, {"last_contacted": latest}, username)
+
+
 def create_meeting(fields: dict, username: str) -> dict:
     record = {
         "id": str(uuid.uuid4()),
@@ -313,7 +337,7 @@ def create_meeting(fields: dict, username: str) -> dict:
 
     _atomic_update("meetings.json", _add)
     for cid in _meeting_contact_ids(record):
-        update_contact(cid, {"last_contacted": fields["date"]}, username)
+        _recalculate_last_contacted(cid, username)
     return record
 
 
@@ -324,6 +348,32 @@ def meeting_contact_label(meeting: dict, contact_map: dict) -> str:
     if freetext:
         parts.append(freetext)
     return ", ".join(parts) if parts else "—"
+
+
+def meeting_all_attendees(meeting: dict, contact_map: dict) -> list[str]:
+    """
+    Full ordered attendee list for display inside a meeting expander:
+      1. Linked system contacts (by name)
+      2. Free-text names not in system
+      3. Additional attendees field
+    Duplicates are removed while preserving order.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for cid in _meeting_contact_ids(meeting):
+        name = contact_map.get(cid, {}).get("name", "")
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    for ft in [n.strip() for n in meeting.get("contact_display", "").split(",") if n.strip()]:
+        if ft not in seen:
+            seen.add(ft)
+            result.append(ft)
+    for a in meeting.get("attendees", []):
+        if a and a not in seen:
+            seen.add(a)
+            result.append(a)
+    return result
 
 
 def update_meeting(mid: str, fields: dict, username: str) -> None:
@@ -339,11 +389,15 @@ def update_meeting(mid: str, fields: dict, username: str) -> None:
     meeting = next((m for m in get_meetings() if m["id"] == mid), None)
     if meeting:
         for cid in _meeting_contact_ids(meeting):
-            update_contact(cid, {"last_contacted": meeting["date"]}, username)
+            _recalculate_last_contacted(cid, username)
 
 
-def delete_meeting(mid: str) -> None:
+def delete_meeting(mid: str, username: str = "system") -> None:
+    meeting = next((m for m in get_meetings() if m["id"] == mid), None)
+    linked_cids = _meeting_contact_ids(meeting) if meeting else []
     _atomic_update("meetings.json", lambda d: [m for m in d if m["id"] != mid])
+    for cid in linked_cids:
+        _recalculate_last_contacted(cid, username)
 
 
 # ─── CRUD: Datasets ───────────────────────────────────────────────────────────
@@ -586,11 +640,14 @@ def page_contacts():
         if not contacts:
             st.info("No contacts yet. An admin can create the first one.")
         else:
-            col1, col2 = st.columns([2, 1])
+            col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
                 search = st.text_input("Search name or institution", placeholder="Type to filter…")
             with col2:
                 stage_filter = st.selectbox("Filter by stage", ["All"] + PARTNERSHIP_STAGES)
+            with col3:
+                all_tags = sorted({t for c in contacts for t in c.get("tags", []) if t})
+                tag_filter = st.multiselect("Filter by tag", all_tags)
 
             filtered = contacts
             if search:
@@ -602,6 +659,8 @@ def page_contacts():
                 ]
             if stage_filter != "All":
                 filtered = [c for c in filtered if c.get("partnership_stage") == stage_filter]
+            if tag_filter:
+                filtered = [c for c in filtered if any(t in c.get("tags", []) for t in tag_filter)]
 
             if not filtered:
                 st.warning("No contacts match the current filters.")
@@ -650,7 +709,7 @@ def page_contacts():
     if can_write():
         with tab_objects[1]:
             st.subheader("New Contact")
-            with st.form("new_contact", clear_on_submit=True):
+            with st.form("new_contact"):
                 col1, col2 = st.columns(2)
                 with col1:
                     name = st.text_input("Full Name *")
@@ -669,23 +728,44 @@ def page_contacts():
                 if not name or not institution:
                     st.error("Name and Institution are required.")
                 else:
-                    create_contact(
-                        {
-                            "name": name,
-                            "institution": institution,
-                            "role": role,
-                            "email": email,
-                            "phone": phone,
-                            "country": country,
-                            "website": website,
-                            "partnership_stage": stage,
-                            "notes": notes,
-                            "tags": [t.strip() for t in tags.split(",") if t.strip()],
-                        },
-                        current_username(),
-                    )
-                    st.success(f"Contact '{name}' created.")
-                    st.rerun()
+                    # Deduplication check
+                    nl = name.strip().lower()
+                    il = institution.strip().lower()
+                    similar = [
+                        c for c in get_contacts()
+                        if nl in c.get("name", "").lower() or c.get("name", "").lower() in nl
+                    ]
+                    warn_key = f"{nl}|{il}"
+                    already_warned = st.session_state.get("dedup_warn_key") == warn_key
+
+                    if similar and not already_warned:
+                        st.session_state["dedup_warn_key"] = warn_key
+                        names_str = ", ".join(
+                            f"**{c['name']}** ({c.get('institution', '')})" for c in similar[:3]
+                        )
+                        st.warning(
+                            f"Similar contacts already exist: {names_str}\n\n"
+                            "Click **Create Contact** again to save anyway."
+                        )
+                    else:
+                        create_contact(
+                            {
+                                "name": name,
+                                "institution": institution,
+                                "role": role,
+                                "email": email,
+                                "phone": phone,
+                                "country": country,
+                                "website": website,
+                                "partnership_stage": stage,
+                                "notes": notes,
+                                "tags": [t.strip() for t in tags.split(",") if t.strip()],
+                            },
+                            current_username(),
+                        )
+                        st.session_state.pop("dedup_warn_key", None)
+                        st.success(f"Contact '{name}' created.")
+                        st.rerun()
 
     # ── Tab: Contact detail ──
     detail_tab = tab_objects[-1]
@@ -723,16 +803,21 @@ def page_contacts():
 
         # Delete confirmation
         if st.session_state.get("confirm_delete_contact") == cid:
-            st.warning(
-                "This will permanently delete the contact and all linked meetings and datasets."
-            )
+            linked_meeting_count = len(get_meetings_for_contact(cid))
+            linked_dataset_count = len(get_datasets_for_contact(cid))
+            warn_lines = ["**Permanently delete this contact?**"]
+            if linked_meeting_count:
+                warn_lines.append(
+                    f"⚠️ {linked_meeting_count} linked meeting(s) will become unlinked."
+                )
+            if linked_dataset_count:
+                warn_lines.append(
+                    f"⚠️ {linked_dataset_count} linked dataset(s) will lose their main contact point."
+                )
+            st.warning("\n\n".join(warn_lines))
             c1, c2, _ = st.columns([1, 1, 3])
             with c1:
                 if st.button("Confirm Delete", type="primary"):
-                    for m in get_meetings_for_contact(cid):
-                        delete_meeting(m["id"])
-                    for d in get_datasets_for_contact(cid):
-                        delete_dataset(d["id"])
                     delete_contact(cid)
                     st.session_state.pop("selected_contact_id", None)
                     st.session_state.pop("confirm_delete_contact", None)
@@ -834,8 +919,9 @@ def page_contacts():
                         f"📅 {m.get('date')}  ·  {m.get('meeting_type')}  ·  {m.get('summary','')}"
                     )
                     with st.expander(label):
-                        if m.get("attendees"):
-                            st.markdown(f"**Attendees:** {', '.join(m['attendees'])}")
+                        all_att_cd = meeting_all_attendees(m, contact_map_cd)
+                        if all_att_cd:
+                            st.markdown(f"**Attendees:** {', '.join(all_att_cd)}")
                         st.markdown(f"**Notes:**\n\n{m.get('notes') or '—'}")
                         if m.get("action_items"):
                             st.markdown(f"**Action Items:**\n\n{m['action_items']}")
@@ -907,9 +993,23 @@ def page_contacts():
                                             )
                                             st.success("Meeting updated.")
                                             st.rerun()
-                            if st.button("Delete this meeting", key=f"del_m_{m['id']}"):
-                                delete_meeting(m["id"])
-                                st.rerun()
+                            mid_cd = m["id"]
+                            if st.session_state.get("confirm_delete_meeting") == mid_cd:
+                                st.warning("Are you sure you want to delete this meeting?")
+                                ca, cb = st.columns(2)
+                                with ca:
+                                    if st.button("Yes, delete", key=f"conf_del_m_cd_{mid_cd}", type="primary"):
+                                        delete_meeting(mid_cd, current_username())
+                                        st.session_state.pop("confirm_delete_meeting", None)
+                                        st.rerun()
+                                with cb:
+                                    if st.button("Cancel", key=f"canc_del_m_cd_{mid_cd}"):
+                                        st.session_state.pop("confirm_delete_meeting", None)
+                                        st.rerun()
+                            else:
+                                if st.button("Delete this meeting", key=f"del_m_{mid_cd}"):
+                                    st.session_state["confirm_delete_meeting"] = mid_cd
+                                    st.rerun()
 
         # ── Datasets ──
         with datasets_tab:
@@ -1012,11 +1112,12 @@ def page_meetings():
         if not meetings:
             st.info("No meetings logged yet.")
         else:
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
             with col1:
                 search = st.text_input("Search notes or summary")
             with col2:
                 type_filter = st.selectbox("Meeting Type", ["All"] + MEETING_TYPES)
+            col3, col4, col5 = st.columns(3)
             with col3:
                 # Build per-name filter options from all individual contact names in meetings
                 individual_names: set[str] = set()
@@ -1028,6 +1129,10 @@ def page_meetings():
                     if ft:
                         individual_names.add(ft)
                 contact_filter = st.selectbox("Contact / Name", ["All"] + sorted(individual_names))
+            with col4:
+                date_from = st.date_input("From date", value=None, key="mtg_date_from")
+            with col5:
+                date_to = st.date_input("To date", value=None, key="mtg_date_to")
 
             filtered = meetings
             if search:
@@ -1046,6 +1151,10 @@ def page_meetings():
                             return True
                     return contact_filter in m.get("contact_display", "")
                 filtered = [m for m in filtered if _meeting_matches_filter(m)]
+            if date_from:
+                filtered = [m for m in filtered if m.get("date", "") >= date_from.isoformat()]
+            if date_to:
+                filtered = [m for m in filtered if m.get("date", "") <= date_to.isoformat()]
 
             filtered = sorted(filtered, key=lambda m: m.get("date", ""), reverse=True)
             st.markdown(f"**{len(filtered)} meeting(s) found**")
@@ -1082,8 +1191,9 @@ def page_meetings():
                     f"  ·  {m.get('summary','')}"
                 )
                 with st.expander(label):
-                    if m.get("attendees"):
-                        st.markdown(f"**Attendees:** {', '.join(m['attendees'])}")
+                    all_att = meeting_all_attendees(m, contact_map)
+                    if all_att:
+                        st.markdown(f"**Attendees:** {', '.join(all_att)}")
                     st.markdown(f"**Notes:**\n\n{m.get('notes') or '—'}")
                     if m.get("action_items"):
                         st.markdown(f"**Action Items:**\n\n{m['action_items']}")
@@ -1155,9 +1265,23 @@ def page_meetings():
                                         )
                                         st.success("Meeting updated.")
                                         st.rerun()
-                        if st.button("Delete this meeting", key=f"del_m_pg_{m['id']}"):
-                            delete_meeting(m["id"])
-                            st.rerun()
+                        mid = m["id"]
+                        if st.session_state.get("confirm_delete_meeting") == mid:
+                            st.warning("Are you sure you want to delete this meeting?")
+                            ca, cb = st.columns(2)
+                            with ca:
+                                if st.button("Yes, delete", key=f"conf_del_m_pg_{mid}", type="primary"):
+                                    delete_meeting(mid, current_username())
+                                    st.session_state.pop("confirm_delete_meeting", None)
+                                    st.rerun()
+                            with cb:
+                                if st.button("Cancel", key=f"canc_del_m_pg_{mid}"):
+                                    st.session_state.pop("confirm_delete_meeting", None)
+                                    st.rerun()
+                        else:
+                            if st.button("Delete this meeting", key=f"del_m_pg_{mid}"):
+                                st.session_state["confirm_delete_meeting"] = mid
+                                st.rerun()
 
 
 # ─── UI: Datasets ────────────────────────────────────────────────────────────
@@ -1387,9 +1511,23 @@ def page_datasets():
                                         )
                                         st.success("Dataset updated.")
                                         st.rerun()
-                        if st.button("Delete", key=f"ds_del_pg_{d['id']}"):
-                            delete_dataset(d["id"])
-                            st.rerun()
+                        did = d["id"]
+                        if st.session_state.get("confirm_delete_dataset") == did:
+                            st.warning("Are you sure you want to delete this dataset?")
+                            da, db = st.columns(2)
+                            with da:
+                                if st.button("Yes, delete", key=f"conf_del_ds_{did}", type="primary"):
+                                    delete_dataset(did)
+                                    st.session_state.pop("confirm_delete_dataset", None)
+                                    st.rerun()
+                            with db:
+                                if st.button("Cancel", key=f"canc_del_ds_{did}"):
+                                    st.session_state.pop("confirm_delete_dataset", None)
+                                    st.rerun()
+                        else:
+                            if st.button("Delete", key=f"ds_del_pg_{did}"):
+                                st.session_state["confirm_delete_dataset"] = did
+                                st.rerun()
 
 
 # ─── UI: Change Password (all roles) ────────────────────────────────────────
@@ -1586,6 +1724,9 @@ def page_admin():
 
 
 def main():
+    # Check session timeout on every render
+    check_session_timeout()
+
     # Gate: must be logged in
     if "user" not in st.session_state:
         page_login()
@@ -1606,11 +1747,16 @@ def main():
             pages.append("Admin Panel")
         pages.append("Change Password")
 
-        page = st.radio("Navigate", pages, label_visibility="collapsed")
+        page = st.radio(
+            "Navigate",
+            pages,
+            label_visibility="collapsed",
+            key="current_page",
+        )
 
         st.divider()
         if st.button("Log Out", use_container_width=True):
-            del st.session_state["user"]
+            st.session_state.clear()
             st.rerun()
 
     if page == "Dashboard":
