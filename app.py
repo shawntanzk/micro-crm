@@ -68,6 +68,14 @@ DATASET_STATUSES = [
     "Archived",
 ]
 
+PROJECT_STATUSES = [
+    "Planning",
+    "Active",
+    "On Hold",
+    "Completed",
+    "Cancelled",
+]
+
 STAGE_COLORS = {
     "Prospect": "#94a3b8",
     "Initial Contact": "#60a5fa",
@@ -166,10 +174,36 @@ def _get_conn() -> sqlite3.Connection:
             size          TEXT,
             description   TEXT,
             notes         TEXT,
+            tags          TEXT DEFAULT '[]',
             created_at    TEXT,
             created_by    TEXT,
             updated_at    TEXT,
             updated_by    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS stage_history (
+            id         TEXT PRIMARY KEY,
+            contact_id TEXT NOT NULL,
+            old_stage  TEXT,
+            new_stage  TEXT,
+            changed_at TEXT,
+            changed_by TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS projects (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            description     TEXT,
+            status          TEXT,
+            main_contact_id TEXT NOT NULL,
+            dataset_ids     TEXT DEFAULT '[]',
+            nda_signed      INTEGER DEFAULT 0,
+            notes           TEXT,
+            tags            TEXT DEFAULT '[]',
+            created_at      TEXT,
+            created_by      TEXT,
+            updated_at      TEXT,
+            updated_by      TEXT
         );
         """
         )
@@ -177,6 +211,30 @@ def _get_conn() -> sqlite3.Connection:
         # Migration: add recovery_code_hash if this is an existing DB without it
         try:
             conn.execute("ALTER TABLE users ADD COLUMN recovery_code_hash TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: add tags to datasets
+        try:
+            conn.execute("ALTER TABLE datasets ADD COLUMN tags TEXT DEFAULT '[]'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: add tags to meetings
+        try:
+            conn.execute("ALTER TABLE meetings ADD COLUMN tags TEXT DEFAULT '[]'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: add project_id to meetings
+        try:
+            conn.execute("ALTER TABLE meetings ADD COLUMN project_id TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: add dataset_ids to projects
+        try:
+            conn.execute("ALTER TABLE projects ADD COLUMN dataset_ids TEXT DEFAULT '[]'")
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -224,12 +282,32 @@ def _parse_contact(row: dict) -> dict:
 
 
 def _parse_meeting(row: dict) -> dict:
-    for field in ("contact_ids", "attendees"):
+    for field in ("contact_ids", "attendees", "tags"):
         raw = row.get(field)
         try:
             row[field] = json.loads(raw) if raw else []
         except (ValueError, TypeError):
             row[field] = []
+    return row
+
+
+def _parse_dataset(row: dict) -> dict:
+    raw = row.get("tags")
+    try:
+        row["tags"] = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        row["tags"] = []
+    return row
+
+
+def _parse_project(row: dict) -> dict:
+    for field in ("tags", "dataset_ids"):
+        raw = row.get(field)
+        try:
+            row[field] = json.loads(raw) if raw else []
+        except (ValueError, TypeError):
+            row[field] = []
+    row["nda_signed"] = bool(row.get("nda_signed", 0))
     return row
 
 
@@ -400,6 +478,22 @@ _CONTACT_COLUMNS = frozenset(
 )
 
 
+# ─── CRUD: Stage History ──────────────────────────────────────────────────────
+
+def _log_stage_change(contact_id: str, old_stage: str, new_stage: str, changed_at: str, changed_by: str) -> None:
+    _db_write(
+        "INSERT INTO stage_history (id, contact_id, old_stage, new_stage, changed_at, changed_by) VALUES (?,?,?,?,?,?)",
+        (str(uuid.uuid4()), contact_id, old_stage, new_stage, changed_at, changed_by),
+    )
+
+
+def get_stage_history(contact_id: str) -> list:
+    return _db_query(
+        "SELECT * FROM stage_history WHERE contact_id = ? ORDER BY changed_at ASC",
+        (contact_id,),
+    )
+
+
 def get_contacts() -> list:
     rows = _db_query("SELECT * FROM contacts ORDER BY name")
     return [_parse_contact(r) for r in rows]
@@ -448,6 +542,14 @@ def update_contact(cid: str, fields: dict, username: str) -> None:
             safe[k] = json.dumps(v) if k == "tags" else v
     if not safe:
         return
+    # Detect and log stage changes before writing
+    if "partnership_stage" in safe:
+        current = _db_query_one("SELECT partnership_stage FROM contacts WHERE id = ?", (cid,))
+        if current:
+            old_stage = current.get("partnership_stage", "") or ""
+            new_stage = safe["partnership_stage"] or ""
+            if old_stage != new_stage:
+                _log_stage_change(cid, old_stage, new_stage, now, username)
     set_clause = ", ".join(f"{k} = ?" for k in safe)
     params = tuple(safe.values()) + (now, username, cid)
     _db_write(
@@ -465,10 +567,10 @@ def delete_contact(cid: str) -> None:
 _MEETING_COLUMNS = frozenset(
     {
         "contact_ids", "contact_display", "date", "meeting_type",
-        "summary", "attendees", "notes", "action_items",
+        "summary", "attendees", "notes", "action_items", "tags", "project_id",
     }
 )
-_MEETING_JSON_FIELDS = frozenset({"contact_ids", "attendees"})
+_MEETING_JSON_FIELDS = frozenset({"contact_ids", "attendees", "tags"})
 
 
 def get_meetings() -> list:
@@ -507,8 +609,8 @@ def create_meeting(fields: dict, username: str) -> dict:
         """
         INSERT INTO meetings
             (id, contact_ids, contact_display, date, meeting_type,
-             summary, attendees, notes, action_items, created_at, created_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             summary, attendees, notes, action_items, tags, project_id, created_at, created_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             mid,
@@ -520,6 +622,8 @@ def create_meeting(fields: dict, username: str) -> dict:
             json.dumps(fields.get("attendees", [])),
             fields.get("notes", ""),
             fields.get("action_items", ""),
+            json.dumps(fields.get("tags", [])),
+            fields.get("project_id") or None,
             now, username,
         ),
     )
@@ -599,17 +703,20 @@ def delete_meeting(mid: str, username: str = "system") -> None:
 _DATASET_COLUMNS = frozenset(
     {
         "contact_id", "name", "format", "status",
-        "acquired_date", "size", "description", "notes",
+        "acquired_date", "size", "description", "notes", "tags",
     }
 )
+_DATASET_JSON_FIELDS = frozenset({"tags"})
 
 
 def get_datasets() -> list:
-    return _db_query("SELECT * FROM datasets ORDER BY acquired_date DESC")
+    rows = _db_query("SELECT * FROM datasets ORDER BY acquired_date DESC")
+    return [_parse_dataset(r) for r in rows]
 
 
 def get_datasets_for_contact(cid: str) -> list:
-    return _db_query("SELECT * FROM datasets WHERE contact_id = ?", (cid,))
+    rows = _db_query("SELECT * FROM datasets WHERE contact_id = ?", (cid,))
+    return [_parse_dataset(r) for r in rows]
 
 
 def create_dataset(fields: dict, username: str) -> dict:
@@ -619,8 +726,8 @@ def create_dataset(fields: dict, username: str) -> dict:
         """
         INSERT INTO datasets
             (id, contact_id, name, format, status, acquired_date, size,
-             description, notes, created_at, created_by, updated_at, updated_by)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             description, notes, tags, created_at, created_by, updated_at, updated_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             did,
@@ -632,15 +739,20 @@ def create_dataset(fields: dict, username: str) -> dict:
             fields.get("size", ""),
             fields.get("description", ""),
             fields.get("notes", ""),
+            json.dumps(fields.get("tags", [])),
             now, username, now, username,
         ),
     )
-    return _db_query_one("SELECT * FROM datasets WHERE id = ?", (did,))
+    row = _db_query_one("SELECT * FROM datasets WHERE id = ?", (did,))
+    return _parse_dataset(row)
 
 
 def update_dataset(did: str, fields: dict, username: str) -> None:
     now = datetime.now().isoformat()
-    safe = {k: v for k, v in fields.items() if k in _DATASET_COLUMNS}
+    safe = {}
+    for k, v in fields.items():
+        if k in _DATASET_COLUMNS:
+            safe[k] = json.dumps(v) if k in _DATASET_JSON_FIELDS else v
     if not safe:
         return
     set_clause = ", ".join(f"{k} = ?" for k in safe)
@@ -653,6 +765,85 @@ def update_dataset(did: str, fields: dict, username: str) -> None:
 
 def delete_dataset(did: str) -> None:
     _db_write("DELETE FROM datasets WHERE id = ?", (did,))
+
+
+# ─── CRUD: Projects ───────────────────────────────────────────────────────────
+
+_PROJECT_COLUMNS = frozenset(
+    {
+        "name", "description", "status",
+        "main_contact_id", "dataset_ids", "nda_signed", "notes", "tags",
+    }
+)
+_PROJECT_JSON_FIELDS = frozenset({"tags", "dataset_ids"})
+
+
+def get_projects() -> list:
+    rows = _db_query("SELECT * FROM projects ORDER BY created_at DESC")
+    return [_parse_project(r) for r in rows]
+
+
+def get_project(pid: str) -> dict | None:
+    row = _db_query_one("SELECT * FROM projects WHERE id = ?", (pid,))
+    return _parse_project(row) if row else None
+
+
+def get_projects_for_contact(cid: str) -> list:
+    rows = _db_query("SELECT * FROM projects WHERE main_contact_id = ?", (cid,))
+    return [_parse_project(r) for r in rows]
+
+
+def create_project(fields: dict, username: str) -> dict:
+    pid = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    _db_write(
+        """
+        INSERT INTO projects
+            (id, name, description, status,
+             main_contact_id, dataset_ids, nda_signed, notes, tags,
+             created_at, created_by, updated_at, updated_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            pid,
+            fields.get("name", ""),
+            fields.get("description", ""),
+            fields.get("status", ""),
+            fields.get("main_contact_id", ""),
+            json.dumps(fields.get("dataset_ids", [])),
+            1 if fields.get("nda_signed") else 0,
+            fields.get("notes", ""),
+            json.dumps(fields.get("tags", [])),
+            now, username, now, username,
+        ),
+    )
+    row = _db_query_one("SELECT * FROM projects WHERE id = ?", (pid,))
+    return _parse_project(row)
+
+
+def update_project(pid: str, fields: dict, username: str) -> None:
+    now = datetime.now().isoformat()
+    safe = {}
+    for k, v in fields.items():
+        if k in _PROJECT_COLUMNS:
+            if k in _PROJECT_JSON_FIELDS:
+                safe[k] = json.dumps(v)
+            elif k == "nda_signed":
+                safe[k] = 1 if v else 0
+            else:
+                safe[k] = v
+    if not safe:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in safe)
+    params = tuple(safe.values()) + (now, username, pid)
+    _db_write(
+        f"UPDATE projects SET {set_clause}, updated_at = ?, updated_by = ? WHERE id = ?",
+        params,
+    )
+
+
+def delete_project(pid: str) -> None:
+    _db_write("DELETE FROM projects WHERE id = ?", (pid,))
 
 
 # ─── UI: Login / First-Run Setup ──────────────────────────────────────────────
@@ -1133,6 +1324,25 @@ def page_contacts():
             f"Last edited by **{contact.get('updated_by')}** on {contact.get('updated_at','')[:10]}"
         )
 
+        # Stage history
+        stage_history = get_stage_history(cid)
+        if stage_history:
+            with st.expander("Stage Change History", expanded=False):
+                for entry in stage_history:
+                    old = entry.get("old_stage") or "—"
+                    new = entry.get("new_stage") or "—"
+                    when = entry.get("changed_at", "")[:10]
+                    who = entry.get("changed_by", "")
+                    old_color = STAGE_COLORS.get(old, "#94a3b8")
+                    new_color = STAGE_COLORS.get(new, "#94a3b8")
+                    st.markdown(
+                        f"**{when}** by {who} — "
+                        f"<span style='background:{old_color};color:white;padding:2px 8px;border-radius:10px;font-size:0.75rem'>{old}</span>"
+                        f" → "
+                        f"<span style='background:{new_color};color:white;padding:2px 8px;border-radius:10px;font-size:0.75rem'>{new}</span>",
+                        unsafe_allow_html=True,
+                    )
+
         st.divider()
 
         # Sub-tabs: Meetings & Datasets
@@ -1149,6 +1359,10 @@ def page_contacts():
             else:
                 all_contacts_cd = get_contacts()
                 contact_map_cd = {c["id"]: c for c in all_contacts_cd}
+                all_projects_cd = get_projects()
+                project_map_cd = {p["id"]: p for p in all_projects_cd}
+                cd_proj_name_to_id = {p["name"]: p["id"] for p in all_projects_cd}
+                cd_proj_names_list = ["(none)"] + [p["name"] for p in sorted(all_projects_cd, key=lambda p: p["name"])]
                 for m in sorted(meetings, key=lambda x: x.get("date", ""), reverse=True):
                     label = (
                         f"📅 {m.get('date')}  ·  {m.get('meeting_type')}  ·  {m.get('summary','')}"
@@ -1157,9 +1371,13 @@ def page_contacts():
                         all_att_cd = meeting_all_attendees(m, contact_map_cd)
                         if all_att_cd:
                             st.markdown(f"**Attendees:** {', '.join(all_att_cd)}")
+                        if m.get("project_id") and m["project_id"] in project_map_cd:
+                            st.markdown(f"**Project:** {project_map_cd[m['project_id']]['name']}")
                         st.markdown(f"**Notes:**\n\n{m.get('notes') or '—'}")
                         if m.get("action_items"):
                             st.markdown(f"**Action Items:**\n\n{m['action_items']}")
+                        if m.get("tags"):
+                            st.markdown("**Tags:** " + " · ".join(f"`{t}`" for t in m["tags"]))
                         updated = m.get("updated_by")
                         if updated:
                             st.caption(
@@ -1177,6 +1395,9 @@ def page_contacts():
                                 ecd_name_to_id = {c["name"]: c["id"] for c in all_contacts_cd}
                                 ecd_id_to_name = {c["id"]: c["name"] for c in all_contacts_cd}
                                 ecd_default = [ecd_id_to_name[i] for i in _meeting_contact_ids(m) if i in ecd_id_to_name]
+                                ecd_proj_default_idx = next(
+                                    (i for i, n in enumerate(cd_proj_names_list) if cd_proj_name_to_id.get(n) == m.get("project_id")), 0
+                                )
                                 with st.form(f"edit_m_cd_{m['id']}"):
                                     col1, col2 = st.columns(2)
                                     with col1:
@@ -1191,6 +1412,12 @@ def page_contacts():
                                             key=f"ecd_type_{m['id']}",
                                         )
                                         e_summary = st.text_input("Summary / Topic", value=m.get("summary", ""), key=f"ecd_sum_{m['id']}")
+                                        e_project_cd = st.selectbox(
+                                            "Associated Project",
+                                            cd_proj_names_list,
+                                            index=ecd_proj_default_idx,
+                                            key=f"ecd_proj_{m['id']}",
+                                        )
                                     with col2:
                                         e_contact_sel = st.multiselect(
                                             "Contacts (from system)",
@@ -1208,6 +1435,7 @@ def page_contacts():
                                         )
                                     e_notes = st.text_area("Notes", value=m.get("notes", ""), key=f"ecd_notes_{m['id']}")
                                     e_actions = st.text_area("Action Items", value=m.get("action_items", ""), key=f"ecd_act_{m['id']}")
+                                    e_tags_cd = st.text_input("Tags", value=", ".join(m.get("tags", [])), key=f"ecd_tags_{m['id']}")
                                     if st.form_submit_button("Save Changes", type="primary"):
                                         if not e_summary:
                                             st.error("Summary is required.")
@@ -1223,6 +1451,8 @@ def page_contacts():
                                                     "attendees": [a.strip() for a in e_attendees.split(",") if a.strip()],
                                                     "notes": e_notes,
                                                     "action_items": e_actions,
+                                                    "tags": [t.strip() for t in e_tags_cd.split(",") if t.strip()],
+                                                    "project_id": cd_proj_name_to_id.get(e_project_cd) if e_project_cd != "(none)" else None,
                                                 },
                                                 current_username(),
                                             )
@@ -1282,7 +1512,9 @@ def page_meetings():
 
     contacts = get_contacts()
     meetings = get_meetings()
+    projects = get_projects()
     contact_map = {c["id"]: c for c in contacts}
+    project_map = {p["id"]: p for p in projects}
 
     tabs = ["All Meetings"]
     if can_write():
@@ -1290,6 +1522,9 @@ def page_meetings():
     tab_objects = st.tabs(tabs)
 
     # ── Tab: Log Meeting ──
+    proj_name_to_id = {p["name"]: p["id"] for p in projects}
+    proj_names_list = ["(none)"] + [p["name"] for p in sorted(projects, key=lambda p: p["name"])]
+
     if can_write():
         with tab_objects[1]:
             st.subheader("Log a New Meeting")
@@ -1303,6 +1538,7 @@ def page_meetings():
                     m_date = st.date_input("Date", value=datetime.today())
                     m_type = st.selectbox("Meeting Type", MEETING_TYPES)
                     m_summary = st.text_input("Summary / Topic *")
+                    m_project = st.selectbox("Associated Project (optional)", proj_names_list)
                 with col2:
                     m_contact_sel = st.multiselect(
                         "Contacts (from system)",
@@ -1316,6 +1552,7 @@ def page_meetings():
                     m_attendees = st.text_input("Additional attendees (comma-separated)")
                 m_notes = st.text_area("Meeting Notes")
                 m_actions = st.text_area("Action Items")
+                m_tags = st.text_input("Tags (comma-separated)")
 
                 if st.form_submit_button("Log Meeting", type="primary"):
                     if not m_summary:
@@ -1333,6 +1570,8 @@ def page_meetings():
                                 "attendees": [a.strip() for a in m_attendees.split(",") if a.strip()],
                                 "notes": m_notes,
                                 "action_items": m_actions,
+                                "tags": [t.strip() for t in m_tags.split(",") if t.strip()],
+                                "project_id": proj_name_to_id.get(m_project) if m_project != "(none)" else None,
                             },
                             current_username(),
                         )
@@ -1347,11 +1586,14 @@ def page_meetings():
         if not meetings:
             st.info("No meetings logged yet.")
         else:
-            col1, col2 = st.columns(2)
+            col1, col2, col6 = st.columns(3)
             with col1:
                 search = st.text_input("Search notes or summary")
             with col2:
                 type_filter = st.selectbox("Meeting Type", ["All"] + MEETING_TYPES)
+            with col6:
+                all_mtg_tags = sorted({t for m in meetings for t in m.get("tags", []) if t})
+                mtg_tag_filter = st.multiselect("Filter by tag", all_mtg_tags)
             col3, col4, col5 = st.columns(3)
             with col3:
                 # Build per-name filter options from all individual contact names in meetings
@@ -1390,6 +1632,8 @@ def page_meetings():
                 filtered = [m for m in filtered if m.get("date", "") >= date_from.isoformat()]
             if date_to:
                 filtered = [m for m in filtered if m.get("date", "") <= date_to.isoformat()]
+            if mtg_tag_filter:
+                filtered = [m for m in filtered if any(t in m.get("tags", []) for t in mtg_tag_filter)]
 
             filtered = sorted(filtered, key=lambda m: m.get("date", ""), reverse=True)
             st.markdown(f"**{len(filtered)} meeting(s) found**")
@@ -1428,9 +1672,13 @@ def page_meetings():
                     all_att = meeting_all_attendees(m, contact_map)
                     if all_att:
                         st.markdown(f"**Attendees:** {', '.join(all_att)}")
+                    if m.get("project_id") and m["project_id"] in project_map:
+                        st.markdown(f"**Project:** {project_map[m['project_id']]['name']}")
                     st.markdown(f"**Notes:**\n\n{m.get('notes') or '—'}")
                     if m.get("action_items"):
                         st.markdown(f"**Action Items:**\n\n{m['action_items']}")
+                    if m.get("tags"):
+                        st.markdown("**Tags:** " + " · ".join(f"`{t}`" for t in m["tags"]))
                     updated = m.get("updated_by")
                     if updated:
                         st.caption(
@@ -1448,6 +1696,9 @@ def page_meetings():
                             em_name_to_id = {c["name"]: c["id"] for c in contacts}
                             em_id_to_name = {c["id"]: c["name"] for c in contacts}
                             em_default = [em_id_to_name[cid] for cid in _meeting_contact_ids(m) if cid in em_id_to_name]
+                            em_proj_default_idx = next(
+                                (i for i, n in enumerate(proj_names_list) if proj_name_to_id.get(n) == m.get("project_id")), 0
+                            )
                             with st.form(f"edit_m_{m['id']}"):
                                 col1, col2 = st.columns(2)
                                 with col1:
@@ -1462,6 +1713,12 @@ def page_meetings():
                                         key=f"em_type_{m['id']}",
                                     )
                                     e_summary = st.text_input("Summary / Topic", value=m.get("summary", ""), key=f"em_sum_{m['id']}")
+                                    e_project = st.selectbox(
+                                        "Associated Project",
+                                        proj_names_list,
+                                        index=em_proj_default_idx,
+                                        key=f"em_proj_{m['id']}",
+                                    )
                                 with col2:
                                     e_contact_sel = st.multiselect(
                                         "Contacts (from system)",
@@ -1479,6 +1736,7 @@ def page_meetings():
                                     )
                                 e_notes = st.text_area("Notes", value=m.get("notes", ""), key=f"em_notes_{m['id']}")
                                 e_actions = st.text_area("Action Items", value=m.get("action_items", ""), key=f"em_act_{m['id']}")
+                                e_tags_m = st.text_input("Tags", value=", ".join(m.get("tags", [])), key=f"em_tags_{m['id']}")
                                 if st.form_submit_button("Save Changes", type="primary"):
                                     if not e_summary:
                                         st.error("Summary is required.")
@@ -1494,6 +1752,8 @@ def page_meetings():
                                                 "attendees": [a.strip() for a in e_attendees.split(",") if a.strip()],
                                                 "notes": e_notes,
                                                 "action_items": e_actions,
+                                                "tags": [t.strip() for t in e_tags_m.split(",") if t.strip()],
+                                                "project_id": proj_name_to_id.get(e_project) if e_project != "(none)" else None,
                                             },
                                             current_username(),
                                         )
@@ -1566,6 +1826,7 @@ def page_datasets():
                             "Acquired / Expected Date", value=datetime.today()
                         )
                         ds_size = st.text_input("Size / Volume (e.g. 50 GB, 10 k records)")
+                        ds_tags = st.text_input("Tags (comma-separated)")
                     ds_desc = st.text_area("Description")
                     ds_notes = st.text_area("Notes / Caveats")
 
@@ -1584,6 +1845,7 @@ def page_datasets():
                                     "size": ds_size,
                                     "description": ds_desc,
                                     "notes": ds_notes,
+                                    "tags": [t.strip() for t in ds_tags.split(",") if t.strip()],
                                 },
                                 current_username(),
                             )
@@ -1608,11 +1870,14 @@ def page_datasets():
 
             st.divider()
 
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
                 status_filter = st.selectbox("Filter by Status", ["All"] + DATASET_STATUSES)
             with col2:
                 search = st.text_input("Search name or description")
+            with col3:
+                all_ds_tags = sorted({t for d in datasets for t in d.get("tags", []) if t})
+                ds_tag_filter = st.multiselect("Filter by tag", all_ds_tags)
 
             filtered = datasets
             if status_filter != "All":
@@ -1625,6 +1890,8 @@ def page_datasets():
                     if sl in d.get("name", "").lower()
                     or sl in d.get("description", "").lower()
                 ]
+            if ds_tag_filter:
+                filtered = [d for d in filtered if any(t in d.get("tags", []) for t in ds_tag_filter)]
 
             rows = []
             for d in filtered:
@@ -1673,6 +1940,8 @@ def page_datasets():
                         st.markdown(f"**Description:** {d['description']}")
                     if d.get("notes"):
                         st.markdown(f"**Notes:** {d['notes']}")
+                    if d.get("tags"):
+                        st.markdown("**Tags:** " + " · ".join(f"`{t}`" for t in d["tags"]))
                     updated_ds = d.get("updated_by")
                     if updated_ds:
                         st.caption(
@@ -1722,6 +1991,7 @@ def page_datasets():
                                 with col2:
                                     e_acq = st.date_input("Acquired / Expected Date", value=current_acq, key=f"eds_acq_{d['id']}")
                                     e_size = st.text_input("Size / Volume", value=d.get("size", ""), key=f"eds_sz_{d['id']}")
+                                    e_tags_ds = st.text_input("Tags", value=", ".join(d.get("tags", [])), key=f"eds_tags_{d['id']}")
                                 e_desc = st.text_area("Description", value=d.get("description", ""), key=f"eds_desc_{d['id']}")
                                 e_notes = st.text_area("Notes / Caveats", value=d.get("notes", ""), key=f"eds_notes_{d['id']}")
                                 if st.form_submit_button("Save Changes", type="primary"):
@@ -1740,6 +2010,7 @@ def page_datasets():
                                                 "size": e_size,
                                                 "description": e_desc,
                                                 "notes": e_notes,
+                                                "tags": [t.strip() for t in e_tags_ds.split(",") if t.strip()],
                                             },
                                             current_username(),
                                         )
@@ -1878,6 +2149,267 @@ def page_change_password():
                         "Save this somewhere safe — it won't be shown again. "
                         "Your previous code is no longer valid."
                     )
+
+
+# ─── UI: Projects ────────────────────────────────────────────────────────────
+
+
+def page_projects():
+    st.title("Projects")
+
+    contacts = get_contacts()
+    projects = get_projects()
+    datasets = get_datasets()
+    contact_map = {c["id"]: c for c in contacts}
+    dataset_map = {d["id"]: d for d in datasets}
+
+    tabs = ["All Projects"]
+    if can_write():
+        tabs.insert(1, "Add Project")
+    tabs.append("Project Detail")
+    tab_objects = st.tabs(tabs)
+
+    # ── Tab: All Projects ──
+    with tab_objects[0]:
+        if not projects:
+            st.info("No projects yet.")
+        else:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                search = st.text_input("Search name or description", key="proj_search")
+            with col2:
+                status_filter = st.selectbox("Filter by status", ["All"] + PROJECT_STATUSES, key="proj_sf")
+            with col3:
+                all_proj_tags = sorted({t for p in projects for t in p.get("tags", []) if t})
+                proj_tag_filter = st.multiselect("Filter by tag", all_proj_tags, key="proj_tf")
+
+            filtered = projects
+            if search:
+                sl = search.lower()
+                filtered = [p for p in filtered if sl in p.get("name", "").lower() or sl in p.get("description", "").lower()]
+            if status_filter != "All":
+                filtered = [p for p in filtered if p.get("status") == status_filter]
+            if proj_tag_filter:
+                filtered = [p for p in filtered if any(t in p.get("tags", []) for t in proj_tag_filter)]
+
+            if not filtered:
+                st.warning("No projects match the current filters.")
+            else:
+                rows = []
+                for p in filtered:
+                    c = contact_map.get(p.get("main_contact_id", ""), {})
+                    ds_names = ", ".join(dataset_map[did]["name"] for did in p.get("dataset_ids", []) if did in dataset_map)
+                    rows.append({
+                        "_id": p["id"],
+                        "Name": p.get("name", ""),
+                        "Status": p.get("status", ""),
+                        "Main Contact": c.get("name", "—"),
+                        "Institution": c.get("institution", ""),
+                        "NDA/CDA Signed": "Yes" if p.get("nda_signed") else "No",
+                        "Datasets": ds_names or "—",
+                        "Tags": ", ".join(p.get("tags", [])),
+                    })
+                df = pd.DataFrame(rows)
+                event = st.dataframe(
+                    df.drop(columns=["_id"]),
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                )
+                sel = event.selection.get("rows", [])
+                if sel:
+                    st.session_state["selected_project_id"] = df.iloc[sel[0]]["_id"]
+                    st.info(f"Selected **{df.iloc[sel[0]]['Name']}** — open 'Project Detail' tab to view.")
+
+                csv = df.drop(columns=["_id"]).to_csv(index=False).encode()
+                st.download_button("Export to CSV", data=csv, file_name="projects_export.csv", mime="text/csv")
+
+    # ── Tab: Add Project ──
+    if can_write():
+        with tab_objects[1]:
+            st.subheader("New Project")
+            if not contacts:
+                st.warning("No contacts exist yet. Create a contact first — every project requires a main contact.")
+            else:
+                contact_options = sorted(contacts, key=lambda c: c["name"])
+                contact_display_options = [f"{c['name']}  ·  {c.get('institution','')}" for c in contact_options]
+                dataset_options = sorted(datasets, key=lambda d: d["name"])
+                dataset_name_to_id = {d["name"]: d["id"] for d in dataset_options}
+                dataset_names_list = list(dataset_name_to_id.keys())
+
+                with st.form("new_project", clear_on_submit=True):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        p_name = st.text_input("Project Name *")
+                        p_status = st.selectbox("Status", PROJECT_STATUSES)
+                        p_nda = st.checkbox("NDA/CDA Signed")
+                        p_tags = st.text_input("Tags (comma-separated)")
+                    with col2:
+                        st.markdown("**Main Contact** *(required)*")
+                        p_contact_idx = st.selectbox(
+                            "Select contact",
+                            range(len(contact_options)),
+                            format_func=lambda i: contact_display_options[i],
+                            key="new_proj_contact",
+                        )
+                        p_datasets = st.multiselect(
+                            "Associated Datasets",
+                            options=dataset_names_list,
+                            help="Optionally link one or more datasets to this project.",
+                        )
+                    p_desc = st.text_area("Description")
+                    p_notes = st.text_area("Notes")
+                    if st.form_submit_button("Create Project", type="primary"):
+                        if not p_name:
+                            st.error("Project name is required.")
+                        else:
+                            chosen = contact_options[p_contact_idx]
+                            create_project(
+                                {
+                                    "name": p_name,
+                                    "status": p_status,
+                                    "main_contact_id": chosen["id"],
+                                    "dataset_ids": [dataset_name_to_id[n] for n in p_datasets if n in dataset_name_to_id],
+                                    "nda_signed": p_nda,
+                                    "tags": [t.strip() for t in p_tags.split(",") if t.strip()],
+                                    "description": p_desc,
+                                    "notes": p_notes,
+                                },
+                                current_username(),
+                            )
+                            st.success(f"Project **{p_name}** created.")
+                            st.rerun()
+
+    # ── Tab: Project Detail ──
+    detail_tab = tab_objects[-1]
+    with detail_tab:
+        pid = st.session_state.get("selected_project_id")
+        if not pid:
+            st.info("Select a project from 'All Projects' to view its detail.")
+            return
+
+        project = get_project(pid)
+        if not project:
+            st.error("Project not found.")
+            st.session_state.pop("selected_project_id", None)
+            return
+
+        main_contact = contact_map.get(project.get("main_contact_id", ""), {})
+
+        col_hdr, col_actions = st.columns([3, 1])
+        with col_hdr:
+            st.markdown(f"## {project['name']}")
+            st.caption(
+                f"Status: **{project.get('status', '—')}**  ·  "
+                f"Main Contact: **{main_contact.get('name', '—')}** ({main_contact.get('institution', '—')})"
+            )
+        with col_actions:
+            if can_edit_record(project):
+                if st.button("🗑 Delete Project", type="secondary", use_container_width=True):
+                    st.session_state["confirm_delete_project"] = pid
+
+        if st.session_state.get("confirm_delete_project") == pid:
+            st.warning("**Permanently delete this project?**")
+            c1, c2, _ = st.columns([1, 1, 3])
+            with c1:
+                if st.button("Confirm Delete", type="primary", key="conf_del_proj"):
+                    delete_project(pid)
+                    st.session_state.pop("selected_project_id", None)
+                    st.session_state.pop("confirm_delete_project", None)
+                    st.success("Project deleted.")
+                    st.rerun()
+            with c2:
+                if st.button("Cancel", key="canc_del_proj"):
+                    st.session_state.pop("confirm_delete_project", None)
+                    st.rerun()
+
+        st.divider()
+
+        if can_edit_record(project):
+            with st.expander("Edit Project", expanded=True):
+                contact_options_d = sorted(contacts, key=lambda c: c["name"])
+                contact_display_d = [f"{c['name']}  ·  {c.get('institution','')}" for c in contact_options_d]
+                current_c_idx = next(
+                    (i for i, c in enumerate(contact_options_d) if c["id"] == project.get("main_contact_id")), 0
+                )
+                current_status_idx = (
+                    PROJECT_STATUSES.index(project.get("status", PROJECT_STATUSES[0]))
+                    if project.get("status") in PROJECT_STATUSES else 0
+                )
+                ds_opts_d = sorted(datasets, key=lambda d: d["name"])
+                ds_name_to_id_d = {d["name"]: d["id"] for d in ds_opts_d}
+                ds_id_to_name_d = {d["id"]: d["name"] for d in ds_opts_d}
+                ds_names_list_d = list(ds_name_to_id_d.keys())
+                ds_default_d = [ds_id_to_name_d[did] for did in project.get("dataset_ids", []) if did in ds_id_to_name_d]
+
+                with st.form("edit_project"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        ep_name = st.text_input("Project Name", value=project.get("name", ""))
+                        ep_status = st.selectbox("Status", PROJECT_STATUSES, index=current_status_idx)
+                        ep_nda = st.checkbox("NDA/CDA Signed", value=bool(project.get("nda_signed")))
+                        ep_tags = st.text_input("Tags", value=", ".join(project.get("tags", [])))
+                    with col2:
+                        st.markdown("**Main Contact** *(required)*")
+                        ep_contact_idx = st.selectbox(
+                            "Contact",
+                            range(len(contact_options_d)),
+                            index=current_c_idx,
+                            format_func=lambda i: contact_display_d[i],
+                            key="ep_contact",
+                        )
+                        ep_datasets = st.multiselect(
+                            "Associated Datasets",
+                            options=ds_names_list_d,
+                            default=ds_default_d,
+                            key="ep_datasets",
+                        )
+                    ep_desc = st.text_area("Description", value=project.get("description", ""))
+                    ep_notes = st.text_area("Notes", value=project.get("notes", ""))
+                    if st.form_submit_button("Save Changes", type="primary"):
+                        if not ep_name:
+                            st.error("Project name is required.")
+                        else:
+                            chosen = contact_options_d[ep_contact_idx]
+                            update_project(
+                                pid,
+                                {
+                                    "name": ep_name,
+                                    "status": ep_status,
+                                    "main_contact_id": chosen["id"],
+                                    "dataset_ids": [ds_name_to_id_d[n] for n in ep_datasets if n in ds_name_to_id_d],
+                                    "nda_signed": ep_nda,
+                                    "tags": [t.strip() for t in ep_tags.split(",") if t.strip()],
+                                    "description": ep_desc,
+                                    "notes": ep_notes,
+                                },
+                                current_username(),
+                            )
+                            st.success("Project updated.")
+                            st.rerun()
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**Status:** {project.get('status', '—')}")
+                st.markdown(f"**Main Contact:** {main_contact.get('name', '—')}")
+                st.markdown(f"**Institution:** {main_contact.get('institution', '—')}")
+                st.markdown(f"**NDA/CDA Signed:** {'Yes' if project.get('nda_signed') else 'No'}")
+            with col2:
+                linked_ds = [dataset_map[did] for did in project.get("dataset_ids", []) if did in dataset_map]
+                if linked_ds:
+                    st.markdown("**Datasets:** " + ", ".join(d["name"] for d in linked_ds))
+                if project.get("tags"):
+                    st.markdown("**Tags:** " + " · ".join(f"`{t}`" for t in project["tags"]))
+            if project.get("description"):
+                st.markdown(f"**Description:** {project['description']}")
+            if project.get("notes"):
+                st.markdown(f"**Notes:** {project['notes']}")
+
+        st.caption(
+            f"Created by **{project.get('created_by')}** on {project.get('created_at','')[:10]}  |  "
+            f"Last edited by **{project.get('updated_by')}** on {project.get('updated_at','')[:10]}"
+        )
 
 
 # ─── UI: Admin Panel ─────────────────────────────────────────────────────────
@@ -2082,7 +2614,7 @@ def main():
         st.caption(f"Role: {role_label}")
         st.divider()
 
-        pages = ["Dashboard", "Contacts", "Meetings", "Datasets"]
+        pages = ["Dashboard", "Contacts", "Meetings", "Datasets", "Projects"]
         if is_admin():
             pages.append("Admin Panel")
         pages.append("Change Password")
@@ -2107,6 +2639,8 @@ def main():
         page_meetings()
     elif page == "Datasets":
         page_datasets()
+    elif page == "Projects":
+        page_projects()
     elif page == "Admin Panel":
         page_admin()
     elif page == "Change Password":
