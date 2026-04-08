@@ -38,6 +38,119 @@ micro-crm/
 
 ---
 
+## Data model
+
+```mermaid
+erDiagram
+    users {
+        TEXT id PK
+        TEXT username
+        TEXT password_hash
+        TEXT role
+        INTEGER is_active
+        TEXT recovery_code_hash
+        TEXT created_at
+        TEXT created_by
+    }
+
+    contacts {
+        TEXT id PK
+        TEXT name
+        TEXT institution
+        TEXT role
+        TEXT email
+        TEXT phone
+        TEXT country
+        TEXT website
+        TEXT partnership_stage
+        TEXT notes
+        TEXT tags
+        TEXT last_contacted
+        TEXT created_at
+        TEXT created_by
+        TEXT updated_at
+        TEXT updated_by
+    }
+
+    meetings {
+        TEXT id PK
+        TEXT contact_ids
+        TEXT contact_display
+        TEXT date
+        TEXT meeting_type
+        TEXT summary
+        TEXT attendees
+        TEXT notes
+        TEXT action_items
+        TEXT tags
+        TEXT project_id FK
+        TEXT created_at
+        TEXT created_by
+        TEXT updated_at
+        TEXT updated_by
+    }
+
+    datasets {
+        TEXT id PK
+        TEXT contact_id FK
+        TEXT name
+        TEXT format
+        TEXT status
+        TEXT acquired_date
+        TEXT size
+        TEXT description
+        TEXT notes
+        TEXT tags
+        TEXT created_at
+        TEXT created_by
+        TEXT updated_at
+        TEXT updated_by
+    }
+
+    projects {
+        TEXT id PK
+        TEXT name
+        TEXT description
+        TEXT status
+        TEXT main_contact_id FK
+        TEXT dataset_ids
+        INTEGER nda_signed
+        TEXT notes
+        TEXT tags
+        TEXT created_at
+        TEXT created_by
+        TEXT updated_at
+        TEXT updated_by
+    }
+
+    stage_history {
+        TEXT id PK
+        TEXT contact_id FK
+        TEXT old_stage
+        TEXT new_stage
+        TEXT changed_at
+        TEXT changed_by
+    }
+
+    project_stage_history {
+        TEXT id PK
+        TEXT project_id FK
+        TEXT old_stage
+        TEXT new_stage
+        TEXT changed_at
+        TEXT changed_by
+    }
+
+    contacts ||--o{ meetings : "linked via contact_ids"
+    contacts ||--o{ datasets : "contact_id"
+    contacts ||--o{ projects : "main_contact_id"
+    contacts ||--o{ stage_history : "contact_id"
+    projects ||--o{ meetings : "project_id"
+    projects ||--o{ project_stage_history : "project_id"
+```
+
+---
+
 ## Backend: SQLite
 
 All data is stored in a single SQLite file (`crm.db`) inside `CRM_DATA_DIR`. SQLite is embedded directly in the Python process — no separate database server is required. This makes it ideal for Domino: just point `CRM_DATA_DIR` at a persisted dataset mount and the database file travels with it.
