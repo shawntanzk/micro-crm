@@ -190,6 +190,15 @@ def _get_conn() -> sqlite3.Connection:
             changed_by TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS project_stage_history (
+            id         TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            old_stage  TEXT,
+            new_stage  TEXT,
+            changed_at TEXT,
+            changed_by TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS projects (
             id              TEXT PRIMARY KEY,
             name            TEXT NOT NULL,
@@ -491,6 +500,20 @@ def get_stage_history(contact_id: str) -> list:
     return _db_query(
         "SELECT * FROM stage_history WHERE contact_id = ? ORDER BY changed_at ASC",
         (contact_id,),
+    )
+
+
+def _log_project_stage_change(project_id: str, old_stage: str, new_stage: str, changed_at: str, changed_by: str) -> None:
+    _db_write(
+        "INSERT INTO project_stage_history (id, project_id, old_stage, new_stage, changed_at, changed_by) VALUES (?,?,?,?,?,?)",
+        (str(uuid.uuid4()), project_id, old_stage, new_stage, changed_at, changed_by),
+    )
+
+
+def get_project_stage_history(project_id: str) -> list:
+    return _db_query(
+        "SELECT * FROM project_stage_history WHERE project_id = ? ORDER BY changed_at ASC",
+        (project_id,),
     )
 
 
@@ -834,6 +857,14 @@ def update_project(pid: str, fields: dict, username: str) -> None:
                 safe[k] = v
     if not safe:
         return
+    # Detect and log stage changes before writing
+    if "status" in safe:
+        current = _db_query_one("SELECT status FROM projects WHERE id = ?", (pid,))
+        if current:
+            old_stage = current.get("status", "") or ""
+            new_stage = safe["status"] or ""
+            if old_stage != new_stage:
+                _log_project_stage_change(pid, old_stage, new_stage, now, username)
     set_clause = ", ".join(f"{k} = ?" for k in safe)
     params = tuple(safe.values()) + (now, username, pid)
     _db_write(
@@ -2405,6 +2436,16 @@ def page_projects():
                 st.markdown(f"**Description:** {project['description']}")
             if project.get("notes"):
                 st.markdown(f"**Notes:** {project['notes']}")
+
+        proj_stage_history = get_project_stage_history(pid)
+        if proj_stage_history:
+            with st.expander("Status Change History", expanded=False):
+                for entry in proj_stage_history:
+                    old = entry.get("old_stage") or "—"
+                    new = entry.get("new_stage") or "—"
+                    when = entry.get("changed_at", "")[:10]
+                    who = entry.get("changed_by", "")
+                    st.markdown(f"**{when}** by {who} — **{old}** → **{new}**")
 
         st.caption(
             f"Created by **{project.get('created_by')}** on {project.get('created_at','')[:10]}  |  "
