@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import threading
+import secrets
 import uuid
 from datetime import datetime
 import pandas as pd
@@ -170,6 +171,12 @@ def _get_conn() -> sqlite3.Connection:
         """
         )
         conn.commit()
+        # Migration: add recovery_code_hash if this is an existing DB without it
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN recovery_code_hash TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         _db_conn = conn
     return _db_conn
 
@@ -342,6 +349,42 @@ def reset_user_password(uid: str, new_password: str) -> None:
         "UPDATE users SET password_hash = ? WHERE id = ?",
         (hash_password(new_password), uid),
     )
+
+
+# ─── Password Recovery ────────────────────────────────────────────────────────
+
+_RECOVERY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # omits 0/O/1/I for readability
+
+
+def _make_recovery_code() -> str:
+    """Generate a readable 8-character recovery code."""
+    return "".join(secrets.choice(_RECOVERY_ALPHABET) for _ in range(8))
+
+
+def generate_and_store_recovery_code(uid: str) -> str:
+    """Create a new recovery code, persist its bcrypt hash, return the plaintext."""
+    code = _make_recovery_code()
+    code_hash = bcrypt.hashpw(code.encode(), bcrypt.gensalt()).decode()
+    _db_write(
+        "UPDATE users SET recovery_code_hash = ? WHERE id = ?",
+        (code_hash, uid),
+    )
+    return code
+
+
+def verify_recovery_code(uid: str, code: str) -> bool:
+    """Return True if the submitted code matches the stored hash."""
+    row = _db_query_one(
+        "SELECT recovery_code_hash FROM users WHERE id = ?", (uid,)
+    )
+    if not row or not row.get("recovery_code_hash"):
+        return False
+    try:
+        return bcrypt.checkpw(
+            code.strip().upper().encode(), row["recovery_code_hash"].encode()
+        )
+    except Exception:
+        return False
 
 
 # ─── CRUD: Contacts ───────────────────────────────────────────────────────────
@@ -619,25 +662,47 @@ def page_login():
     )
     st.markdown("")
 
+    # ── Show recovery code if one was just generated for a new account ──
+    if "_recovery_code_to_show" in st.session_state:
+        rc_username = st.session_state.pop("_rc_username", "")
+        rc_code = st.session_state.pop("_recovery_code_to_show", "")
+        col_l, col_c, col_r = st.columns([1, 1.2, 1])
+        with col_c:
+            st.success(f"Account **{rc_username}** created! Please log in.")
+            st.warning(
+                f"**Save your recovery code:** `{rc_code}`\n\n"
+                "Store it somewhere safe — this is the only time it will be shown. "
+                "You will need it to reset your password if you forget it."
+            )
+            if st.button("I've saved my code — Go to Login", type="primary", use_container_width=True):
+                st.rerun()
+        return
+
     users = get_users()
 
     # ── First-run: no users exist ──
     if not users:
         st.info("No accounts found. Create the first admin account to get started.")
-        with st.form("first_setup"):
-            username = st.text_input("Choose a username")
-            password = st.text_input("Choose a password", type="password")
-            confirm = st.text_input("Confirm password", type="password")
-            submitted = st.form_submit_button("Create Admin Account", type="primary")
-        if submitted:
-            if not username or not password:
-                st.error("Username and password are required.")
-            elif password != confirm:
-                st.error("Passwords do not match.")
-            else:
-                create_user(username, password, role="admin", created_by="system")
-                st.success("Admin account created — please log in.")
-                st.rerun()
+        col_l, col_c, col_r = st.columns([1, 1.2, 1])
+        with col_c:
+            with st.form("first_setup"):
+                username = st.text_input("Choose a username")
+                password = st.text_input("Choose a password", type="password")
+                confirm = st.text_input("Confirm password", type="password")
+                submitted = st.form_submit_button("Create Admin Account", type="primary", use_container_width=True)
+            if submitted:
+                if not username or not password:
+                    st.error("Username and password are required.")
+                elif password != confirm:
+                    st.error("Passwords do not match.")
+                elif len(password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
+                    new_user = create_user(username, password, role="admin", created_by="system")
+                    code = generate_and_store_recovery_code(new_user["id"])
+                    st.session_state["_rc_username"] = username
+                    st.session_state["_recovery_code_to_show"] = code
+                    st.rerun()
         return
 
     # ── Normal login ──
@@ -655,6 +720,10 @@ def page_login():
                 st.rerun()
             else:
                 st.error("Invalid credentials or account is inactive.")
+        st.markdown("")
+        if st.button("Forgot your password?", use_container_width=True):
+            st.session_state["_recovery_mode"] = True
+            st.rerun()
 
 
 # ─── UI: Dashboard ────────────────────────────────────────────────────────────
@@ -1692,6 +1761,65 @@ def page_datasets():
                                 st.rerun()
 
 
+# ─── UI: Password Recovery (pre-login) ───────────────────────────────────────
+
+
+def page_password_recovery():
+    st.markdown(
+        "<h1 style='text-align:center'>🔬 Research Partnership CRM</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    col_l, col_c, col_r = st.columns([1, 1.2, 1])
+    with col_c:
+        st.subheader("Reset Password")
+        st.caption(
+            "Enter your username and the recovery code you saved when your account was created. "
+            "A new recovery code will be issued after a successful reset."
+        )
+        st.markdown("")
+
+        with st.form("recovery_form"):
+            rec_username = st.text_input("Username")
+            rec_code = st.text_input(
+                "Recovery Code",
+                placeholder="e.g. AB3X7QM2",
+                help="The 8-character code shown when your account was created or last reset.",
+            )
+            new_pw1 = st.text_input("New Password", type="password")
+            new_pw2 = st.text_input("Confirm New Password", type="password")
+            submitted = st.form_submit_button(
+                "Reset Password", type="primary", use_container_width=True
+            )
+
+        if submitted:
+            u = find_user(rec_username)
+            if not u:
+                st.error("Username not found.")
+            elif not u.get("is_active", True):
+                st.error("This account is inactive. Contact an administrator.")
+            elif not verify_recovery_code(u["id"], rec_code):
+                st.error("Invalid recovery code.")
+            elif len(new_pw1) < 6:
+                st.error("Password must be at least 6 characters.")
+            elif new_pw1 != new_pw2:
+                st.error("Passwords do not match.")
+            else:
+                reset_user_password(u["id"], new_pw1)
+                new_code = generate_and_store_recovery_code(u["id"])
+                st.success("Password reset successfully! You can now log in.")
+                st.warning(
+                    f"**New recovery code: `{new_code}`**\n\n"
+                    "Your old code is no longer valid. Save this new code somewhere safe."
+                )
+
+        st.markdown("---")
+        if st.button("Back to Login", use_container_width=True):
+            st.session_state.pop("_recovery_mode", None)
+            st.rerun()
+
+
 # ─── UI: Change Password (all roles) ────────────────────────────────────────
 
 
@@ -1718,6 +1846,35 @@ def page_change_password():
                 else:
                     reset_user_password(me["id"], new_pw1)
                     st.success("Password updated successfully.")
+
+    st.divider()
+    st.subheader("Recovery Code")
+    st.caption(
+        "Your recovery code lets you reset your password from the login screen if you ever "
+        "forget it. Generating a new code immediately invalidates the old one."
+    )
+    col_left, col_center, col_right = st.columns([1, 1.2, 1])
+    with col_center:
+        with st.form("regen_recovery"):
+            confirm_pw = st.text_input(
+                "Confirm current password to generate a new code", type="password"
+            )
+            if st.form_submit_button(
+                "Generate New Recovery Code", use_container_width=True
+            ):
+                me = find_user(current_username())
+                if not me:
+                    st.error("User not found.")
+                elif not bcrypt.checkpw(confirm_pw.encode(), me["password_hash"].encode()):
+                    st.error("Current password is incorrect.")
+                else:
+                    new_code = generate_and_store_recovery_code(me["id"])
+                    st.success("New recovery code generated!")
+                    st.warning(
+                        f"**Your recovery code: `{new_code}`**\n\n"
+                        "Save this somewhere safe — it won't be shown again. "
+                        "Your previous code is no longer valid."
+                    )
 
 
 # ─── UI: Admin Panel ─────────────────────────────────────────────────────────
@@ -1752,12 +1909,25 @@ def page_admin():
             if st.form_submit_button("Create User", type="primary"):
                 if not nu_username or not nu_password:
                     st.error("Username and password are required.")
+                elif len(nu_password) < 6:
+                    st.error("Password must be at least 6 characters.")
                 elif find_user(nu_username):
                     st.error(f"Username '{nu_username}' already exists.")
                 else:
-                    create_user(nu_username, nu_password, nu_role, current_username())
-                    st.success(f"User '{nu_username}' created with role '{nu_role}'.")
+                    new_u = create_user(nu_username, nu_password, nu_role, current_username())
+                    rc = generate_and_store_recovery_code(new_u["id"])
+                    st.session_state["_last_created_user"] = (nu_username, nu_role, rc)
                     st.rerun()
+
+        # Show recovery code for the user that was just created
+        if "_last_created_user" in st.session_state:
+            lc_name, lc_role, lc_code = st.session_state.pop("_last_created_user")
+            st.success(f"User **{lc_name}** created with role **{lc_role}**.")
+            st.warning(
+                f"**Recovery code for '{lc_name}': `{lc_code}`**\n\n"
+                "Share this code with the user and ask them to store it safely. "
+                "It will not be shown again. They can use it to reset their password from the login screen."
+            )
 
         st.divider()
         st.subheader("Existing Users")
@@ -1888,6 +2058,11 @@ def page_admin():
 def main():
     # Check session timeout on every render
     check_session_timeout()
+
+    # Password recovery flow (accessible without being logged in)
+    if st.session_state.get("_recovery_mode"):
+        page_password_recovery()
+        return
 
     # Gate: must be logged in
     if "user" not in st.session_state:
