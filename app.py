@@ -86,7 +86,6 @@ STAGE_COLORS = {
     "Inactive": "#f87171",
 }
 
-SESSION_TIMEOUT_MINUTES = 30
 
 # ─── Database Helpers ─────────────────────────────────────────────────────────
 
@@ -318,20 +317,6 @@ def _parse_project(row: dict) -> dict:
             row[field] = []
     row["nda_signed"] = bool(row.get("nda_signed", 0))
     return row
-
-
-def check_session_timeout():
-    """Log out the user after SESSION_TIMEOUT_MINUTES of inactivity."""
-    if "user" not in st.session_state:
-        return
-    last = st.session_state.get("last_activity")
-    if last:
-        elapsed = (datetime.now() - datetime.fromisoformat(last)).total_seconds() / 60
-        if elapsed > SESSION_TIMEOUT_MINUTES:
-            st.session_state.clear()
-            st.warning(f"You were logged out after {SESSION_TIMEOUT_MINUTES} minutes of inactivity.")
-            st.stop()
-    st.session_state["last_activity"] = datetime.now().isoformat()
 
 
 # ─── Auth Helpers ─────────────────────────────────────────────────────────────
@@ -2632,8 +2617,6 @@ def page_admin():
 
 
 def main():
-    # Check session timeout on every render
-    check_session_timeout()
 
     # Password recovery flow (accessible without being logged in)
     if st.session_state.get("_recovery_mode"):
