@@ -5,7 +5,7 @@ headless = true
 enableCORS = false
 enableXsrfProtection = false
 enableWebsocketCompression = false
-cookieSecret = "3f300365abe41c0ab9367ad7e695ceda4b9f24e80986533bcff8ca56fc7f38d1"
+cookieSecret = "b5df56e014904ae59c704f75918633686f9067b1075cdfdc9f6510370ddd78a3"
 
 [browser]
 gatherUsageStats = false
