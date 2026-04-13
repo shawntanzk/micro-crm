@@ -25,6 +25,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ─── WebSocket Keepalive ──────────────────────────────────────────────────────
+# Pings the Streamlit health endpoint every 30 s to prevent OpenResty from
+# closing the idle WebSocket connection (proxy idle timeout is typically 60 s).
+st.components.v1.html(
+    """
+    <script>
+    (function () {
+        const INTERVAL_MS = 30000;
+        function ping() {
+            fetch("/_stcore/health").catch(() => {});
+        }
+        setInterval(ping, INTERVAL_MS);
+    })();
+    </script>
+    """,
+    height=0,
+)
+
 # ─── Data Directory ───────────────────────────────────────────────────────────
 
 # On Domino, point DATA_DIR at your persisted dataset mount, e.g.:
