@@ -5,10 +5,6 @@ headless = true
 enableCORS = false
 enableXsrfProtection = false
 enableWebsocketCompression = false
-# A stable cookieSecret prevents 400 errors from OpenResty after app restarts.
-# In production (Domino), this is overridden by --server.cookieSecret in app.sh,
-# which reads from the CRM_COOKIE_SECRET environment variable.
-cookieSecret = "local-dev-only-change-for-production"
 
 [browser]
 gatherUsageStats = false
