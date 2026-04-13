@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Domino App launcher — Domino expects the app to listen on port 8888.
-# The CRM_DATA_DIR env var points to persisted storage so data survives
-# workspace restarts.  Set it in your Domino project environment variables.
-#
-# Local usage: bash app.sh
-#   Data is stored in ./crm_data by default when not running in Domino.
+set -euo pipefail
 
-if [ -n "$DOMINO_PROJECT_NAME" ]; then
+echo "=== app.sh starting ==="
+echo "DOMINO_PROJECT_NAME=${DOMINO_PROJECT_NAME:-<not set>}"
+echo "CRM_DATA_DIR=${CRM_DATA_DIR:-<not set>}"
+echo "PWD=$(pwd)"
+echo "PATH=$PATH"
+echo "Python: $(python --version 2>&1 || echo 'not found')"
+echo "Streamlit: $(streamlit --version 2>&1 || echo 'not found')"
+echo "=== Installing/verifying dependencies ==="
+pip install --quiet streamlit
+
+if [ -n "${DOMINO_PROJECT_NAME:-}" ]; then
   # Running inside Domino — use persisted dataset storage.
   export CRM_DATA_DIR="${CRM_DATA_DIR:-/domino/datasets/local/crm_data}"
   mkdir -p "$CRM_DATA_DIR"
+  echo "=== Launching in Domino mode, CRM_DATA_DIR=$CRM_DATA_DIR ==="
   exec streamlit run app.py \
     --server.port 8888 \
     --server.address 0.0.0.0 \
@@ -22,6 +28,7 @@ else
   # Running locally — store data next to the repo, use default Streamlit port.
   export CRM_DATA_DIR="${CRM_DATA_DIR:-$(pwd)/crm_data}"
   mkdir -p "$CRM_DATA_DIR"
+  echo "=== Launching in local mode, CRM_DATA_DIR=$CRM_DATA_DIR ==="
   exec streamlit run app.py \
     --server.port 8501 \
     --server.address 0.0.0.0 \
