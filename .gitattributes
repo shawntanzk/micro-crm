@@ -1,0 +1,5 @@
+# Force LF line endings for shell scripts — prevents \r errors on Linux/Domino
+*.sh text eol=lf
+
+# Default: normalise all text files to LF in the repo
+* text=auto
