@@ -3,7 +3,8 @@
 # The CRM_DATA_DIR env var points to persisted storage so data survives
 # workspace restarts.  Set it in your Domino project environment variables.
 
-export CRM_DATA_DIR="${CRM_DATA_DIR:-/domino/datasets/local/crm_data}"
+CRM_DATA_DIR=$(printf '%s' "${CRM_DATA_DIR:-/domino/datasets/local/crm_data}" | tr -d '\r')
+export CRM_DATA_DIR
 mkdir -p "$CRM_DATA_DIR"
 
 streamlit run app.py \
