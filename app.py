@@ -255,6 +255,18 @@ def _get_conn() -> sqlite3.Connection:
             conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Migration: add last_pinged to contacts
+        try:
+            conn.execute("ALTER TABLE contacts ADD COLUMN last_pinged TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: add attendee_usernames to meetings
+        try:
+            conn.execute("ALTER TABLE meetings ADD COLUMN attendee_usernames TEXT DEFAULT '[]'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         _db_conn = conn
     return _db_conn
 
@@ -299,7 +311,7 @@ def _parse_contact(row: dict) -> dict:
 
 
 def _parse_meeting(row: dict) -> dict:
-    for field in ("contact_ids", "attendees", "tags"):
+    for field in ("contact_ids", "attendees", "attendee_usernames", "tags"):
         raw = row.get(field)
         try:
             row[field] = json.loads(raw) if raw else []
@@ -593,15 +605,24 @@ def delete_contact(cid: str) -> None:
     _db_write("DELETE FROM contacts WHERE id = ?", (cid,))
 
 
+def log_ping(cid: str, date_str: str, username: str) -> None:
+    """Record the date a contact was pinged. Does not affect last_contacted."""
+    now = datetime.now().isoformat()
+    _db_write(
+        "UPDATE contacts SET last_pinged = ?, updated_at = ?, updated_by = ? WHERE id = ?",
+        (date_str, now, username, cid),
+    )
+
+
 # ─── CRUD: Meetings ───────────────────────────────────────────────────────────
 
 _MEETING_COLUMNS = frozenset(
     {
         "contact_ids", "contact_display", "date", "meeting_type",
-        "summary", "attendees", "notes", "action_items", "tags", "project_id",
+        "summary", "attendees", "attendee_usernames", "notes", "action_items", "tags", "project_id",
     }
 )
-_MEETING_JSON_FIELDS = frozenset({"contact_ids", "attendees", "tags"})
+_MEETING_JSON_FIELDS = frozenset({"contact_ids", "attendees", "attendee_usernames", "tags"})
 
 
 def get_meetings() -> list:
@@ -697,6 +718,10 @@ def meeting_all_attendees(meeting: dict, contact_map: dict) -> list[str]:
         if a and a not in seen:
             seen.add(a)
             result.append(a)
+    for uname in meeting.get("attendee_usernames", []):
+        if uname and uname not in seen:
+            seen.add(uname)
+            result.append(uname)
     return result
 
 
@@ -1063,6 +1088,8 @@ def page_dashboard():  # noqa: C901
     overdue = []
     for c in active_contacts:
         lc = c.get("last_contacted")
+        lp = c.get("last_pinged")
+        ping_display = lp[:10] if lp else "Never"
         if lc:
             try:
                 days = (today - datetime.fromisoformat(lc).date()).days
@@ -1073,6 +1100,7 @@ def page_dashboard():  # noqa: C901
                         "Institution": c.get("institution", ""),
                         "Stage": c.get("partnership_stage", ""),
                         "Last Contacted": lc[:10],
+                        "Last Pinged": ping_display,
                         "Days Ago": days,
                     })
             except (ValueError, TypeError):
@@ -1084,6 +1112,7 @@ def page_dashboard():  # noqa: C901
                 "Institution": c.get("institution", ""),
                 "Stage": c.get("partnership_stage", ""),
                 "Last Contacted": "Never",
+                "Last Pinged": ping_display,
                 "Days Ago": 9999,
             })
 
@@ -1558,12 +1587,26 @@ def page_contacts():
                 f"border-radius:12px;font-size:0.8rem'>{contact.get('partnership_stage','')}</span>",
                 unsafe_allow_html=True,
             )
+            lp = contact.get("last_pinged")
+            ping_str = f" · Last pinged: **{lp[:10] if lp else 'Never'}**"
             st.caption(
                 f"{contact.get('role','—')} @ {contact.get('institution','—')} · "
                 f"Last contacted: **{contact.get('last_contacted') or 'Never'}**"
+                + ping_str
             )
 
         with col_actions:
+            if can_write():
+                ping_date = st.date_input(
+                    "Ping date",
+                    value=datetime.today().date(),
+                    key=f"ping_date_{cid}",
+                    label_visibility="collapsed",
+                )
+                if st.button("Log Ping", use_container_width=True, key=f"log_ping_{cid}"):
+                    log_ping(cid, ping_date.isoformat(), current_username())
+                    st.success(f"Ping logged for {ping_date}.")
+                    st.rerun()
             if can_edit_record(contact):
                 if st.button("🗑 Delete Contact", type="secondary", use_container_width=True):
                     st.session_state["confirm_delete_contact"] = cid
@@ -1654,6 +1697,7 @@ def page_contacts():
                 st.markdown(f"**Country:** {contact.get('country','—')}")
                 st.markdown(f"**Website:** {contact.get('website','—')}")
                 st.markdown(f"**Last Contacted:** {contact.get('last_contacted','—')}")
+                st.markdown(f"**Last Pinged:** {contact.get('last_pinged','—') or '—'}")
                 if contact.get("tags"):
                     st.markdown("**Tags:** " + " · ".join(f"`{t}`" for t in contact["tags"]))
             if contact.get("notes"):
@@ -1704,6 +1748,7 @@ def page_contacts():
                 project_map_cd = {p["id"]: p for p in all_projects_cd}
                 cd_proj_name_to_id = {p["name"]: p["id"] for p in all_projects_cd}
                 cd_proj_names_list = ["(none)"] + [p["name"] for p in sorted(all_projects_cd, key=lambda p: p["name"])]
+                cd_active_usernames = sorted(u["username"] for u in get_users() if u.get("is_active"))
                 for m in sorted(meetings, key=lambda x: x.get("date", ""), reverse=True):
                     label = (
                         f"📅 {m.get('date')}  ·  {m.get('meeting_type')}  ·  {m.get('summary','')}"
@@ -1771,8 +1816,14 @@ def page_contacts():
                                             value=m.get("contact_display", ""),
                                             key=f"ecd_cft_{m['id']}",
                                         )
+                                        e_attendee_users_cd = st.multiselect(
+                                            "CRM users attending",
+                                            options=cd_active_usernames,
+                                            default=[u for u in m.get("attendee_usernames", []) if u in cd_active_usernames],
+                                            key=f"ecd_uatt_{m['id']}",
+                                        )
                                         e_attendees = st.text_input(
-                                            "Additional attendees", value=", ".join(m.get("attendees", [])), key=f"ecd_att_{m['id']}"
+                                            "Other attendees (not in CRM, comma-separated)", value=", ".join(m.get("attendees", [])), key=f"ecd_att_{m['id']}"
                                         )
                                     e_notes = st.text_area("Notes", value=m.get("notes", ""), key=f"ecd_notes_{m['id']}")
                                     e_actions = st.text_area("Action Items", value=m.get("action_items", ""), key=f"ecd_act_{m['id']}")
@@ -1789,6 +1840,7 @@ def page_contacts():
                                                     "date": e_date.isoformat(),
                                                     "meeting_type": e_type,
                                                     "summary": e_summary,
+                                                    "attendee_usernames": e_attendee_users_cd,
                                                     "attendees": [a.strip() for a in e_attendees.split(",") if a.strip()],
                                                     "notes": e_notes,
                                                     "action_items": e_actions,
@@ -1854,8 +1906,10 @@ def page_meetings():
     contacts = get_contacts()
     meetings = get_meetings()
     projects = get_projects()
+    users = get_users()
     contact_map = {c["id"]: c for c in contacts}
     project_map = {p["id"]: p for p in projects}
+    active_usernames = sorted(u["username"] for u in users if u.get("is_active"))
 
     tabs = ["All Meetings"]
     if can_write():
@@ -1890,7 +1944,12 @@ def page_meetings():
                         "Other names not in system (comma-separated)",
                         help="Optional — for people not in your contacts list.",
                     )
-                    m_attendees = st.text_input("Additional attendees (comma-separated)")
+                    m_attendee_users = st.multiselect(
+                        "CRM users attending",
+                        options=active_usernames,
+                        help="Select other CRM users who attended.",
+                    )
+                    m_attendees = st.text_input("Other attendees (not in CRM, comma-separated)")
                 m_notes = st.text_area("Meeting Notes")
                 m_actions = st.text_area("Action Items")
                 m_tags = st.text_input("Tags (comma-separated)")
@@ -1908,6 +1967,7 @@ def page_meetings():
                                 "date": m_date.isoformat(),
                                 "meeting_type": m_type,
                                 "summary": m_summary,
+                                "attendee_usernames": m_attendee_users,
                                 "attendees": [a.strip() for a in m_attendees.split(",") if a.strip()],
                                 "notes": m_notes,
                                 "action_items": m_actions,
@@ -2072,8 +2132,14 @@ def page_meetings():
                                         value=m.get("contact_display", ""),
                                         key=f"em_cft_{m['id']}",
                                     )
+                                    e_attendee_users = st.multiselect(
+                                        "CRM users attending",
+                                        options=active_usernames,
+                                        default=[u for u in m.get("attendee_usernames", []) if u in active_usernames],
+                                        key=f"em_uatt_{m['id']}",
+                                    )
                                     e_attendees = st.text_input(
-                                        "Additional attendees", value=", ".join(m.get("attendees", [])), key=f"em_att_{m['id']}"
+                                        "Other attendees (not in CRM, comma-separated)", value=", ".join(m.get("attendees", [])), key=f"em_att_{m['id']}"
                                     )
                                 e_notes = st.text_area("Notes", value=m.get("notes", ""), key=f"em_notes_{m['id']}")
                                 e_actions = st.text_area("Action Items", value=m.get("action_items", ""), key=f"em_act_{m['id']}")
@@ -2090,6 +2156,7 @@ def page_meetings():
                                                 "date": e_date.isoformat(),
                                                 "meeting_type": e_type,
                                                 "summary": e_summary,
+                                                "attendee_usernames": e_attendee_users,
                                                 "attendees": [a.strip() for a in e_attendees.split(",") if a.strip()],
                                                 "notes": e_notes,
                                                 "action_items": e_actions,
