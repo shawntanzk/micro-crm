@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # Domino App launcher — Domino expects the app to listen on port 8888.
-# The CRM_DATA_DIR env var points to persisted storage so data survives
-# workspace restarts.  Set it in your Domino project environment variables.
+# CRM_DATA_DIR must be set as a Domino environment variable pointing to
+# persisted storage so data survives workspace restarts.
 
-# Strip carriage returns in case the file was copied from Windows (CRLF endings)
-CRM_DATA_DIR=$(printf '%s' "${CRM_DATA_DIR:-/domino/datasets/local/crm_data}" | tr -d '\r')
-export CRM_DATA_DIR
 mkdir -p "$CRM_DATA_DIR"
 
 streamlit run app.py \
