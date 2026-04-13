@@ -198,6 +198,15 @@ def _get_conn() -> sqlite3.Connection:
             changed_by TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS dataset_status_history (
+            id         TEXT PRIMARY KEY,
+            dataset_id TEXT NOT NULL,
+            old_status TEXT,
+            new_status TEXT,
+            changed_at TEXT,
+            changed_by TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS projects (
             id              TEXT PRIMARY KEY,
             name            TEXT NOT NULL,
@@ -502,6 +511,20 @@ def get_project_stage_history(project_id: str) -> list:
     )
 
 
+def _log_dataset_status_change(dataset_id: str, old_status: str, new_status: str, changed_at: str, changed_by: str) -> None:
+    _db_write(
+        "INSERT INTO dataset_status_history (id, dataset_id, old_status, new_status, changed_at, changed_by) VALUES (?,?,?,?,?,?)",
+        (str(uuid.uuid4()), dataset_id, old_status, new_status, changed_at, changed_by),
+    )
+
+
+def get_dataset_status_history(dataset_id: str) -> list:
+    return _db_query(
+        "SELECT * FROM dataset_status_history WHERE dataset_id = ? ORDER BY changed_at ASC",
+        (dataset_id,),
+    )
+
+
 def get_contacts() -> list:
     rows = _db_query("SELECT * FROM contacts ORDER BY name")
     return [_parse_contact(r) for r in rows]
@@ -763,6 +786,14 @@ def update_dataset(did: str, fields: dict, username: str) -> None:
             safe[k] = json.dumps(v) if k in _DATASET_JSON_FIELDS else v
     if not safe:
         return
+    # Detect and log status changes before writing
+    if "status" in safe:
+        current = _db_query_one("SELECT status FROM datasets WHERE id = ?", (did,))
+        if current:
+            old_status = current.get("status", "") or ""
+            new_status = safe["status"] or ""
+            if old_status != new_status:
+                _log_dataset_status_change(did, old_status, new_status, now, username)
     set_clause = ", ".join(f"{k} = ?" for k in safe)
     params = tuple(safe.values()) + (now, username, did)
     _db_write(
@@ -939,130 +970,424 @@ def page_login():
 # ─── UI: Dashboard ────────────────────────────────────────────────────────────
 
 
-def page_dashboard():
+def page_dashboard():  # noqa: C901
     st.title("Dashboard")
 
-    contacts = get_contacts()
-    meetings = get_meetings()
-    datasets = get_datasets()
+    contacts  = get_contacts()
+    meetings  = get_meetings()
+    datasets  = get_datasets()
+    projects  = get_projects()
     contact_map = {c["id"]: c for c in contacts}
+    project_map = {p["id"]: p for p in projects}
+    today = datetime.today().date()
 
-    # ── Top KPIs ──
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Contacts", len(contacts))
-    k2.metric("Total Meetings", len(meetings))
-    k3.metric("Total Datasets", len(datasets))
-    active = sum(1 for c in contacts if c.get("partnership_stage") == "Active Partnership")
-    k4.metric("Active Partnerships", active)
-    prospects = sum(1 for c in contacts if c.get("partnership_stage") == "Prospect")
-    k5.metric("Prospects", prospects)
+    # ── Pre-compute commonly needed values ────────────────────────────────────
+    active_contacts    = [c for c in contacts if c.get("partnership_stage") not in ("Inactive", "On Hold")]
+    active_partnerships = sum(1 for c in contacts if c.get("partnership_stage") == "Active Partnership")
+    in_negotiation     = sum(1 for c in contacts if c.get("partnership_stage") == "In Negotiation")
+    active_projects    = sum(1 for p in projects if p.get("status") == "Active")
+    nda_count          = sum(1 for p in projects if p.get("nda_signed"))
 
-    st.divider()
+    # Meetings this month
+    this_month = today.strftime("%Y-%m")
+    meetings_this_month = sum(
+        1 for m in meetings if (m.get("date") or "").startswith(this_month)
+    )
 
-    # ── Charts ──
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        if contacts:
-            stage_counts: dict[str, int] = {}
-            for c in contacts:
-                s = c.get("partnership_stage", "Unknown")
-                stage_counts[s] = stage_counts.get(s, 0) + 1
-            colors = [STAGE_COLORS.get(s, "#94a3b8") for s in stage_counts.keys()]
-            fig = px.pie(
-                values=list(stage_counts.values()),
-                names=list(stage_counts.keys()),
-                title="Contacts by Partnership Stage",
-                color_discrete_sequence=colors,
-            )
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No contacts yet.")
-
-    with col_right:
-        if meetings:
-            df_m = pd.DataFrame(meetings)
-            df_m["date"] = pd.to_datetime(df_m["date"], errors="coerce")
-            df_m["month"] = df_m["date"].dt.to_period("M").astype(str)
-            monthly = df_m.groupby("month").size().reset_index(name="count")
-            fig2 = px.bar(monthly, x="month", y="count", title="Meetings per Month")
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("No meetings logged yet.")
-
-    # ── Dataset status breakdown ──
-    if datasets:
-        st.subheader("Dataset Pipeline")
-        status_counts: dict[str, int] = {s: 0 for s in DATASET_STATUSES}
-        for d in datasets:
-            s = d.get("status", "Unknown")
-            status_counts[s] = status_counts.get(s, 0) + 1
-        cols = st.columns(len(DATASET_STATUSES))
-        for i, s in enumerate(DATASET_STATUSES):
-            cols[i].metric(s, status_counts.get(s, 0))
+    # ── KPI row ───────────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Active Partnerships", active_partnerships)
+    k2.metric("In Negotiation", in_negotiation)
+    k3.metric("Active Projects", active_projects,
+              delta=f"{nda_count} NDA signed" if projects else None)
+    k4.metric("Meetings This Month", meetings_this_month)
+    k5.metric("Datasets", len(datasets))
+    k6.metric("Total Contacts", len(contacts))
 
     st.divider()
 
-    # ── Recent meetings ──
-    st.subheader("Recent Meetings")
-    if meetings:
-        recent = sorted(meetings, key=lambda m: m.get("date", ""), reverse=True)[:8]
-        rows = []
-        for m in recent:
-            c = contact_map.get(m.get("contact_id", ""), {})
-            rows.append(
-                {
-                    "Date": m.get("date"),
-                    "Contact": meeting_contact_label(m, contact_map),
-                    "Institution": c.get("institution", ""),
-                    "Type": m.get("meeting_type"),
-                    "Summary": m.get("summary", ""),
-                    "Logged By": m.get("created_by"),
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("No meetings logged yet.")
-
-    # ── Contacts needing follow-up (no contact in 60+ days) ──
+    # ── Row 1: Partnership pipeline ───────────────────────────────────────────
+    st.subheader("Partnership Pipeline")
     if contacts:
-        st.subheader("Follow-up Needed (60+ days since last contact)")
-        today = datetime.today().date()
-        overdue = []
-        for c in contacts:
-            if c.get("partnership_stage") in ("Inactive", "On Hold"):
-                continue
-            lc = c.get("last_contacted")
-            if lc:
-                try:
-                    days = (today - datetime.fromisoformat(lc).date()).days
-                    if days >= 60:
-                        overdue.append(
-                            {
-                                "Name": c["name"],
-                                "Institution": c.get("institution", ""),
-                                "Stage": c.get("partnership_stage", ""),
-                                "Last Contacted": lc,
-                                "Days Ago": days,
-                            }
-                        )
-                except ValueError:
-                    pass
-            else:
-                overdue.append(
-                    {
+        pipeline_stages = [s for s in PARTNERSHIP_STAGES if s not in ("On Hold", "Inactive")]
+        pipeline_counts = [sum(1 for c in contacts if c.get("partnership_stage") == s) for s in pipeline_stages]
+        fig_pipeline = px.bar(
+            x=pipeline_counts,
+            y=pipeline_stages,
+            orientation="h",
+            color=pipeline_stages,
+            color_discrete_map=STAGE_COLORS,
+            labels={"x": "Contacts", "y": ""},
+            text=pipeline_counts,
+        )
+        fig_pipeline.update_traces(textposition="outside")
+        fig_pipeline.update_layout(
+            showlegend=False,
+            yaxis={"categoryorder": "array", "categoryarray": list(reversed(pipeline_stages))},
+            margin=dict(t=10, b=10, l=10, r=40),
+            height=260,
+        )
+        st.plotly_chart(fig_pipeline, use_container_width=True)
+        paused = sum(1 for c in contacts if c.get("partnership_stage") in ("On Hold", "Inactive"))
+        if paused:
+            st.caption(f"{paused} contact(s) On Hold or Inactive — not shown above.")
+    else:
+        st.info("No contacts yet.")
+
+    # ── Row 2: Dataset pipeline ───────────────────────────────────────────────
+    st.subheader("Dataset Pipeline")
+    if datasets:
+        ds_counts = {s: 0 for s in DATASET_STATUSES}
+        for d in datasets:
+            s = d.get("status") or "Unknown"
+            ds_counts[s] = ds_counts.get(s, 0) + 1
+        fig_ds = px.funnel(
+            y=DATASET_STATUSES,
+            x=[ds_counts.get(s, 0) for s in DATASET_STATUSES],
+            labels={"x": "Datasets", "y": ""},
+        )
+        fig_ds.update_layout(margin=dict(t=10, b=10), height=260)
+        st.plotly_chart(fig_ds, use_container_width=True)
+    else:
+        st.info("No datasets recorded yet.")
+
+    st.divider()
+
+    # ── Row 3: Follow-up urgency ───────────────────────────────────────────────
+    st.subheader("Follow-up Urgency")
+    followup_days = st.slider(
+        "Show contacts not reached in more than N days",
+        min_value=14, max_value=180, value=60, step=7,
+        key="dash_followup",
+    )
+    overdue = []
+    for c in active_contacts:
+        lc = c.get("last_contacted")
+        if lc:
+            try:
+                days = (today - datetime.fromisoformat(lc).date()).days
+                if days >= followup_days:
+                    overdue.append({
+                        "_id": c["id"],
                         "Name": c["name"],
                         "Institution": c.get("institution", ""),
                         "Stage": c.get("partnership_stage", ""),
-                        "Last Contacted": "Never",
-                        "Days Ago": "—",
-                    }
-                )
-        if overdue:
-            st.dataframe(pd.DataFrame(overdue), use_container_width=True, hide_index=True)
+                        "Last Contacted": lc[:10],
+                        "Days Ago": days,
+                    })
+            except (ValueError, TypeError):
+                pass
         else:
-            st.success("All active contacts have been reached in the last 60 days.")
+            overdue.append({
+                "_id": c["id"],
+                "Name": c["name"],
+                "Institution": c.get("institution", ""),
+                "Stage": c.get("partnership_stage", ""),
+                "Last Contacted": "Never",
+                "Days Ago": 9999,
+            })
+
+    overdue_sorted = sorted(overdue, key=lambda r: r["Days Ago"], reverse=True)
+    for r in overdue_sorted:
+        if r["Days Ago"] == 9999:
+            r["Days Ago"] = "Never"
+
+    if overdue_sorted:
+        df_overdue = pd.DataFrame(overdue_sorted)
+        event = st.dataframe(
+            df_overdue.drop(columns=["_id"]),
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+        )
+        sel = event.selection.get("rows", [])
+        if sel:
+            st.session_state["selected_contact_id"] = df_overdue.iloc[sel[0]]["_id"]
+            st.info(
+                f"Selected **{df_overdue.iloc[sel[0]]['Name']}** — go to **Contacts → Contact Detail** to view."
+            )
+    else:
+        st.success(f"All active contacts reached within {followup_days} days.")
+
+    st.divider()
+
+    # ── Row 4: Relationship network ───────────────────────────────────────────
+    st.subheader("Relationship Network")
+    st.caption("Shows how contacts, projects, and datasets are linked.")
+
+    if contacts or projects or datasets:
+        from pyvis.network import Network
+        import streamlit.components.v1 as components
+
+        NEO4J_NODE = {
+            "contact": {"fill": "#4C8EDA", "border": "#2E6DB4", "highlight_fill": "#6aaae8", "highlight_border": "#4C8EDA", "text": "#ffffff", "badge": "Person"},
+            "project": {"fill": "#57C4A7", "border": "#2E9E85", "highlight_fill": "#79d4ba", "highlight_border": "#57C4A7", "text": "#1a1a1a", "badge": "Project"},
+            "dataset": {"fill": "#F0A847", "border": "#C87D1E", "highlight_fill": "#f5c070", "highlight_border": "#F0A847", "text": "#1a1a1a", "badge": "Dataset"},
+        }
+        EDGE_LABELS = {
+            "project-contact": "WORKS_WITH",
+            "project-dataset": "HAS_DATASET",
+            "dataset-contact": "OWNED_BY",
+        }
+
+        # ── Entity filter controls ───────────────────────────────────────────
+        # Selecting any entity auto-includes all directly associated entities.
+        # Leaving all three empty shows the full graph.
+        contact_by_id = {c["id"]: c for c in contacts}
+        project_by_id = {p["id"]: p for p in projects}
+        dataset_by_id = {d["id"]: d for d in datasets}
+
+        nc1, nc2, nc3 = st.columns(3)
+        with nc1:
+            sel_contacts = st.multiselect(
+                "Contacts",
+                options=[c["id"] for c in contacts],
+                format_func=lambda i: contact_by_id[i]["name"],
+                key="net_sel_contacts",
+            )
+        with nc2:
+            sel_projects = st.multiselect(
+                "Projects",
+                options=[p["id"] for p in projects],
+                format_func=lambda i: project_by_id[i]["name"],
+                key="net_sel_projects",
+            )
+        with nc3:
+            sel_datasets = st.multiselect(
+                "Datasets",
+                options=[d["id"] for d in datasets],
+                format_func=lambda i: dataset_by_id[i]["name"],
+                key="net_sel_datasets",
+            )
+
+        # ── Expand associations ───────────────────────────────────────────────
+        if sel_contacts or sel_projects or sel_datasets:
+            inc_contacts: set = set(sel_contacts)
+            inc_projects: set = set(sel_projects)
+            inc_datasets: set = set(sel_datasets)
+
+            # Selected contact → its projects and their datasets, plus direct datasets
+            for cid in list(sel_contacts):
+                for p in projects:
+                    if p.get("main_contact_id") == cid:
+                        inc_projects.add(p["id"])
+                        inc_datasets.update(p.get("dataset_ids", []))
+                for d in datasets:
+                    if d.get("contact_id") == cid:
+                        inc_datasets.add(d["id"])
+
+            # Selected project → its contact and datasets
+            for pid in list(sel_projects):
+                p = project_by_id.get(pid, {})
+                if p.get("main_contact_id"):
+                    inc_contacts.add(p["main_contact_id"])
+                inc_datasets.update(p.get("dataset_ids", []))
+
+            # Selected dataset → its contact and any project that references it
+            for did in list(sel_datasets):
+                d = dataset_by_id.get(did, {})
+                if d.get("contact_id"):
+                    inc_contacts.add(d["contact_id"])
+                for p in projects:
+                    if did in p.get("dataset_ids", []):
+                        inc_projects.add(p["id"])
+                        if p.get("main_contact_id"):
+                            inc_contacts.add(p["main_contact_id"])
+
+            filtered_contacts = [c for c in contacts if c["id"] in inc_contacts]
+            filtered_projects = [p for p in projects if p["id"] in inc_projects]
+            filtered_datasets  = [d for d in datasets  if d["id"] in inc_datasets]
+        else:
+            filtered_contacts = contacts
+            filtered_projects = projects
+            filtered_datasets  = datasets
+
+        contact_ids_in_graph = {c["id"] for c in filtered_contacts}
+        dataset_ids_in_graph  = {d["id"] for d in filtered_datasets}
+
+        # Pre-compute degree so node size scales with connections
+        degree: dict[str, int] = {}
+        for p in filtered_projects:
+            mid = p.get("main_contact_id", "")
+            if mid in contact_ids_in_graph:
+                degree[p["id"]] = degree.get(p["id"], 0) + 1
+                degree[mid]     = degree.get(mid, 0) + 1
+            for did in p.get("dataset_ids", []):
+                if did in dataset_ids_in_graph:
+                    degree[p["id"]] = degree.get(p["id"], 0) + 1
+                    degree[did]     = degree.get(did, 0) + 1
+        for d in filtered_datasets:
+            cid = d.get("contact_id", "")
+            if cid in contact_ids_in_graph:
+                degree[d["id"]] = degree.get(d["id"], 0) + 1
+                degree[cid]     = degree.get(cid, 0) + 1
+
+        total_nodes = len(filtered_contacts) + len(filtered_projects) + len(filtered_datasets)
+
+        if total_nodes == 0:
+            st.info("No nodes to display with current filters.")
+        else:
+            # ── Build pyvis network ───────────────────────────────────────────
+            net = Network(
+                height="660px",
+                bgcolor="#ffffff",
+                font_color="#111827",
+                directed=True,
+                notebook=False,
+            )
+
+            net.set_options("""
+{
+  "physics": {
+    "enabled": true,
+    "barnesHut": {
+      "gravitationalConstant": -8000,
+      "centralGravity": 0.25,
+      "springLength": 220,
+      "springConstant": 0.04,
+      "damping": 0.12,
+      "avoidOverlap": 0.4
+    },
+    "stabilization": { "iterations": 150 }
+  },
+  "edges": {
+    "arrows": { "to": { "enabled": true, "scaleFactor": 0.7 } },
+    "color": { "color": "#9ca3af", "highlight": "#6b7280", "hover": "#6b7280" },
+    "smooth": { "type": "curvedCW", "roundness": 0.15 },
+    "font": { "size": 9, "color": "#6b7280", "align": "middle", "strokeWidth": 2, "strokeColor": "#ffffff" },
+    "width": 1.5,
+    "selectionWidth": 2.5,
+    "hoverWidth": 2.5
+  },
+  "nodes": {
+    "shape": "dot",
+    "borderWidth": 0,
+    "borderWidthSelected": 0,
+    "shadow": { "enabled": false },
+    "font": { "size": 12, "face": "Inter, sans-serif", "bold": { "size": 12 } }
+  },
+  "interaction": {
+    "hover": true,
+    "tooltipDelay": 80,
+    "navigationButtons": true,
+    "keyboard": { "enabled": true },
+    "multiselect": true,
+    "zoomView": true
+  }
+}
+""")
+
+            def _node_size(nid: str, base: int) -> int:
+                return base + degree.get(nid, 0) * 6
+
+            for c in filtered_contacts:
+                col = NEO4J_NODE["contact"]
+                stage = c.get("partnership_stage", "")
+                tooltip = "\n".join(filter(None, [
+                    c["name"],
+                    f"Institution: {c.get('institution') or '—'}",
+                    f"Stage: {stage or '—'}",
+                    f"Country: {c.get('country') or '—'}",
+                ]))
+                net.add_node(
+                    c["id"],
+                    label=c["name"],
+                    title=tooltip,
+                    size=_node_size(c["id"], 22),
+                    color={
+                        "background": col["fill"],
+                        "border": col["fill"],
+                        "highlight": {"background": col["highlight_fill"], "border": col["highlight_fill"]},
+                        "hover":     {"background": col["highlight_fill"], "border": col["highlight_fill"]},
+                    },
+                    font={"color": col["text"], "size": 12},
+                    group="contact",
+                )
+
+            for p in filtered_projects:
+                col = NEO4J_NODE["project"]
+                status = p.get("status", "")
+                fill = "#22c55e" if status == "Active" else col["fill"]
+                tooltip = "\n".join(filter(None, [
+                    p["name"],
+                    f"Status: {status or '—'}",
+                    f"NDA signed: {'Yes' if p.get('nda_signed') else 'No'}",
+                ]))
+                net.add_node(
+                    p["id"],
+                    label=p["name"],
+                    title=tooltip,
+                    size=_node_size(p["id"], 24),
+                    color={
+                        "background": fill,
+                        "border": fill,
+                        "highlight": {"background": col["highlight_fill"], "border": col["highlight_fill"]},
+                        "hover":     {"background": col["highlight_fill"], "border": col["highlight_fill"]},
+                    },
+                    font={"color": col["text"], "size": 12},
+                    group="project",
+                )
+
+            for d in filtered_datasets:
+                col = NEO4J_NODE["dataset"]
+                tooltip = "\n".join(filter(None, [
+                    d["name"],
+                    f"Status: {d.get('status') or '—'}",
+                    f"Format: {d.get('format') or '—'}",
+                ]))
+                net.add_node(
+                    d["id"],
+                    label=d["name"],
+                    title=tooltip,
+                    size=_node_size(d["id"], 20),
+                    color={
+                        "background": col["fill"],
+                        "border": col["fill"],
+                        "highlight": {"background": col["highlight_fill"], "border": col["highlight_fill"]},
+                        "hover":     {"background": col["highlight_fill"], "border": col["highlight_fill"]},
+                    },
+                    font={"color": col["text"], "size": 12},
+                    group="dataset",
+                )
+
+            for p in filtered_projects:
+                mid = p.get("main_contact_id", "")
+                if mid in contact_ids_in_graph:
+                    net.add_edge(p["id"], mid, label=EDGE_LABELS["project-contact"], title="WORKS_WITH")
+                for did in p.get("dataset_ids", []):
+                    if did in dataset_ids_in_graph:
+                        net.add_edge(p["id"], did, label=EDGE_LABELS["project-dataset"], title="HAS_DATASET")
+            for d in filtered_datasets:
+                cid = d.get("contact_id", "")
+                if cid in contact_ids_in_graph:
+                    net.add_edge(d["id"], cid, label=EDGE_LABELS["dataset-contact"], title="OWNED_BY")
+
+            html_str = net.generate_html()
+            components.html(html_str, height=680, scrolling=False)
+
+            # ── Node detail table ────────────────────────────────────────────
+            with st.expander("Node details", expanded=False):
+                node_rows = []
+                for c in filtered_contacts:
+                    node_rows.append({"Type": "Person", "Name": c["name"],
+                                      "Stage / Status": c.get("partnership_stage", ""),
+                                      "Institution / Format": c.get("institution", ""),
+                                      "Connections": degree.get(c["id"], 0)})
+                for p in filtered_projects:
+                    node_rows.append({"Type": "Project", "Name": p["name"],
+                                      "Stage / Status": p.get("status", ""),
+                                      "Institution / Format": "",
+                                      "Connections": degree.get(p["id"], 0)})
+                for d in filtered_datasets:
+                    node_rows.append({"Type": "Dataset", "Name": d["name"],
+                                      "Stage / Status": d.get("status", ""),
+                                      "Institution / Format": d.get("format", ""),
+                                      "Connections": degree.get(d["id"], 0)})
+                df_nodes = pd.DataFrame(node_rows).sort_values(["Type", "Name"])
+                st.dataframe(df_nodes, use_container_width=True, hide_index=True)
+    else:
+        st.info("No data to display yet.")
 
 
 # ─── UI: Contacts ─────────────────────────────────────────────────────────────
@@ -1966,6 +2291,14 @@ def page_datasets():
                         )
                     else:
                         st.caption(f"Added by **{d.get('created_by')}** on {d.get('created_at','')[:10]}")
+                    ds_status_hist = get_dataset_status_history(d["id"])
+                    if ds_status_hist:
+                        with st.expander("Status Change History", expanded=False):
+                            for entry in ds_status_hist:
+                                st.markdown(
+                                    f"**{entry.get('changed_at','')[:10]}** by {entry.get('changed_by','')} — "
+                                    f"**{entry.get('old_status') or '—'}** → **{entry.get('new_status') or '—'}**"
+                                )
                     if can_edit_record(d):
                         st.divider()
                         with st.expander("Edit this dataset", expanded=False):
